@@ -35,17 +35,37 @@ export async function updateStoreProfile(input: {
     address: input.address ?? "", phone: input.phone ?? "", ntn: input.ntn ?? "",
     receipt_header: input.receipt_header ?? "", receipt_footer: input.receipt_footer ?? "", logo_url: input.logo_url ?? "",
   });
+  // The store logo / name / address live in the SHARED admin layout (sidebar +
+  // header, on every page) and are read fresh into POS receipts. Revalidating
+  // only /admin/settings left the cached logo on all other routes — so a new
+  // logo appeared to "not take effect". Revalidate the whole admin layout so the
+  // new logo shows immediately everywhere (headers + invoices/receipts).
+  revalidatePath("/admin", "layout");
   revalidatePath("/admin/settings");
   return { ok: true };
 }
 
 /* ---------------- Store logo upload ---------------- */
 // Reuses the same working Storage mechanism as product photos: one file →
-// public bucket → public URL. The URL is returned so the StoreSection form can
-// persist it on Save (settings.store_info.logo_url), exactly like a pasted URL.
+// public bucket → public URL. Each upload gets a UNIQUE path (so the URL always
+// changes and no browser/CDN can serve a stale cached image), and the new URL is
+// persisted to settings.store_info.logo_url IMMEDIATELY here — not deferred to a
+// separate "Save profile" click. That two-step gap was the bug: uploads landed
+// in storage but the settings record kept pointing at the old logo, so every
+// reader (header, invoice, settings) showed the previous image.
 const LOGO_BUCKET = "product-images";
 const LOGO_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/avif"];
 const LOGO_MAX_BYTES = 5_242_880; // 5 MB
+
+/** Persist the store logo reference and refresh everywhere it's shown. */
+async function persistLogo(db: ReturnType<typeof createAdminClient>, url: string) {
+  await mergeJson(db, "store_info", { logo_url: url });
+  // Logo lives in the SHARED admin layout (header on every page) and is read
+  // into POS/reprint receipts — revalidate the whole admin layout so the new
+  // logo appears immediately without a hard refresh.
+  revalidatePath("/admin", "layout");
+  revalidatePath("/admin/settings");
+}
 
 export async function uploadLogo(formData: FormData): Promise<{ url: string } | { error: string }> {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
@@ -61,7 +81,16 @@ export async function uploadLogo(formData: FormData): Promise<{ url: string } | 
     upsert: true, contentType: file.type, cacheControl: "31536000",
   });
   if (error) return { error: error.message || "Upload failed — please try again." };
-  return { url: db.storage.from(LOGO_BUCKET).getPublicUrl(path).data.publicUrl };
+  const url = db.storage.from(LOGO_BUCKET).getPublicUrl(path).data.publicUrl;
+  await persistLogo(db, url);
+  return { url };
+}
+
+/** Clear the store logo (persisted immediately, mirrors uploadLogo). */
+export async function removeLogo(): Promise<{ ok: true } | { error: string }> {
+  if (!(await requireOwner())) return { error: "Only the owner can change settings." };
+  await persistLogo(createAdminClient(), "");
+  return { ok: true };
 }
 
 /* ---------------- Inventory settings ---------------- */

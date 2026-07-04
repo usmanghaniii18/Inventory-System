@@ -46,8 +46,25 @@ async function emailOtp(email: string, code: string) {
   });
 }
 
-/** Step 1 — verify email+password, then email a one-time code (2nd factor). */
-export async function startLogin(email: string, password: string): Promise<{ otpRequired: true } | { error: string }> {
+/** Marks the current session as 2nd-factor-verified by setting the signed OTP cookie. */
+async function setOtpVerifiedCookie(userId: string, secret: string) {
+  const token = await signOtpSession(userId, OTP_SESSION_TTL_MS, secret);
+  (await cookies()).set(OTP_COOKIE, token, {
+    httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production",
+    path: "/", maxAge: OTP_SESSION_TTL_MS / 1000,
+  });
+}
+
+/**
+ * Step 1 — verify email+password.
+ *
+ * The owner keeps the emailed one-time code as a 2nd factor. Cashiers/managers
+ * sign in with email + password ONLY: the OTP email uses a Resend test sender
+ * that can only deliver to the owner's inbox, so emailing a code to any other
+ * staff address 403s. For them the verified password IS the gate — we set the
+ * OTP-verified cookie directly and never send an email.
+ */
+export async function startLogin(email: string, password: string): Promise<{ otpRequired: true } | { ok: true } | { error: string }> {
   const supabase = await createClient();
   const { data: signIn, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
   if (error || !signIn.user) return { error: "Invalid email or password." };
@@ -61,6 +78,16 @@ export async function startLogin(email: string, password: string): Promise<{ otp
     return { error: "This account isn’t allowed to access the admin portal." };
   }
 
+  const secret = process.env.ADMIN_OTP_SECRET;
+  if (!secret) { await supabase.auth.signOut(); return { error: "Server auth secret not configured (ADMIN_OTP_SECRET)." }; }
+
+  // Cashiers / managers: email + password only (no OTP email is ever sent).
+  if (role !== "owner") {
+    await setOtpVerifiedCookie(signIn.user.id, secret);
+    return { ok: true };
+  }
+
+  // Owner: email a one-time code as the 2nd factor.
   const db = createAdminClient();
   const issued = await issueCode(db, signIn.user.email!, "login");
   if ("error" in issued) { await supabase.auth.signOut(); return { error: issued.error }; }
@@ -97,11 +124,7 @@ export async function verifyOtp(code: string): Promise<{ ok: true } | { error: s
   }
 
   await db.from("auth_codes").update({ consumed: true }).eq("id", row.id);
-  const token = await signOtpSession(user.id, OTP_SESSION_TTL_MS, secret);
-  (await cookies()).set(OTP_COOKIE, token, {
-    httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production",
-    path: "/", maxAge: OTP_SESSION_TTL_MS / 1000,
-  });
+  await setOtpVerifiedCookie(user.id, secret);
   return { ok: true };
 }
 

@@ -21,7 +21,7 @@ import { cn } from "@hamza/shared/utils";
 import {
   updateStoreProfile, updateInventorySettings, updateSalesSettings, updateIntegrations,
   inviteUser, updateUserRole, setUserActive, resetUserPassword, changePassword,
-  importProductsCSV, exportProductsCSV, uploadLogo,
+  importProductsCSV, exportProductsCSV, uploadLogo, removeLogo,
 } from "./actions";
 
 const LOGO_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/avif"];
@@ -102,6 +102,7 @@ function OwnerNote({ isOwner }: { isOwner: boolean }) {
 /* ---------------- Store profile ---------------- */
 function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean }) {
   const { saving, run } = useSaver();
+  const router = useRouter();
   const toast = useToast();
   const [f, setF] = useState(data);
   const [uploadingLogo, setUploadingLogo] = useState(false);
@@ -120,8 +121,21 @@ function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
     const res = await uploadLogo(fd);
     setUploadingLogo(false);
     if ("error" in res) return toast(res.error, "error");
+    // uploadLogo already persisted the new URL to the settings record, so just
+    // sync local state and refresh so the header + invoices show it immediately.
     setF((s) => ({ ...s, logo_url: res.url }));
-    toast("Logo uploaded — click Save profile to apply it everywhere.");
+    router.refresh();
+    toast("Logo updated");
+  }
+
+  async function onRemoveLogo() {
+    setUploadingLogo(true);
+    const res = await removeLogo();
+    setUploadingLogo(false);
+    if ("error" in res) return toast(res.error, "error");
+    setF((s) => ({ ...s, logo_url: "" }));
+    router.refresh();
+    toast("Logo removed");
   }
 
   return (
@@ -157,13 +171,13 @@ function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
                     {uploadingLogo ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImagePlus className="h-4 w-4" />} {f.logo_url ? "Replace" : "Upload"}
                   </Button>
                   {f.logo_url && (
-                    <Button type="button" variant="ghost" size="sm" disabled={!isOwner || uploadingLogo} onClick={() => setF((s) => ({ ...s, logo_url: "" }))}>
+                    <Button type="button" variant="ghost" size="sm" disabled={!isOwner || uploadingLogo} onClick={onRemoveLogo}>
                       <Trash2 className="h-4 w-4" /> Remove
                     </Button>
                   )}
                 </div>
                 <Input value={f.logo_url} disabled={!isOwner} onChange={set("logo_url")} placeholder="…or paste an image URL (https://…)" />
-                <p className="text-[11px] text-text-tertiary">Upload a file or paste a URL. PNG/JPG/WebP up to 5 MB. Shows in the admin header and on invoices/receipts after you Save.</p>
+                <p className="text-[11px] text-text-tertiary">Upload a file (PNG/JPG/WebP up to 5 MB) and it applies immediately in the admin header and on invoices/receipts. To use a pasted image URL instead, click Save profile.</p>
               </div>
             </div>
           </div>
@@ -171,7 +185,7 @@ function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
             <div><Label>Receipt header</Label><Input value={f.receipt_header} disabled={!isOwner} onChange={set("receipt_header")} /></div>
             <div><Label>Receipt footer</Label><Input value={f.receipt_footer} disabled={!isOwner} onChange={set("receipt_footer")} placeholder="Thank you!" /></div>
           </div>
-          {isOwner ? <Button type="submit" disabled={saving}>{saving && <Loader2 className="h-4 w-4 animate-spin" />} Save profile</Button> : <OwnerNote isOwner={isOwner} />}
+          {isOwner ? <Button type="submit" disabled={saving || uploadingLogo}>{saving && <Loader2 className="h-4 w-4 animate-spin" />} Save profile</Button> : <OwnerNote isOwner={isOwner} />}
         </form>
       </CardBody>
     </Card>

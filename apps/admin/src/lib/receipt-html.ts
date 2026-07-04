@@ -84,9 +84,9 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
 <style>
   /* Fix the printed page to the roll width; height follows the content. */
   @page { size: ${RECEIPT_WIDTH_MM}mm auto; margin: 0; }
-  /* Every element on the receipt is the SAME heavy bold weight + pure black — no
-     thin or grey text anywhere, including the item rows and the totals. */
-  * { box-sizing: border-box; font-weight: 700; color: #000; -webkit-text-stroke: 0.3px #000; }
+  /* Pure black ink everywhere (dark + legible on thermal) — but plain, no faux
+     bolding: a clean sans-serif at a light bold weight, not a heavy/hashed look. */
+  * { box-sizing: border-box; color: #000; }
   html, body {
     margin: 0; padding: 0; background: #fff; color: #000;
     width: ${RECEIPT_WIDTH_MM}mm;            /* page is the roll width; height follows content */
@@ -101,34 +101,36 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
        logo/name) and ends right after the footer — paper height = content only,
        no leading or trailing blank band. */
     padding: 0 ${SIDE_PAD_MM}mm 0;
-    font-family: "Courier New", Courier, monospace;
+    /* A simple, clean sans-serif — NOT a fixed-width typewriter (dotted/hashed)
+       face. Crisp and easy to read on the thermal head. */
+    font-family: Arial, Helvetica, "Segoe UI", "Liberation Sans", sans-serif;
     color: #000;
-    font-size: 8pt;
+    /* Slightly larger than before (was 8pt) so it reads more easily on the 80mm
+       thermal head; still comfortably within the roll width. */
+    font-size: 9pt;
     line-height: 1.25;
-    /* Uniform heavy weight; the faux-bold text-shadow + text-stroke thicken every
-       glyph so the small body / table text prints as dark and heavy as the
-       store-name heading on the thermal head. Does NOT affect layout / height. */
-    font-weight: 700;
-    text-shadow: 0.35px 0 0 currentColor, -0.35px 0 0 currentColor;
+    /* Light bold: clearly readable but not heavy/thick. No faux-bold glyph
+       thickening — the real font weight carries it, so glyphs stay crisp. */
+    font-weight: 500;
     -webkit-print-color-adjust: exact; print-color-adjust: exact;
   }
   .center { text-align: center; }
   .r { text-align: right; }
   .c { text-align: center; }
   .logo { max-width: 34mm; max-height: 18mm; object-fit: contain; }
-  .shop { font-weight: 700; font-size: 11pt; }
-  .s7 { font-size: 7pt; }
-  .title { font-weight: 700; font-size: 12pt; margin-top: 2mm; }
+  .shop { font-weight: 600; font-size: 12pt; }
+  .s7 { font-size: 8pt; }
+  .title { font-weight: 600; font-size: 13pt; margin-top: 2mm; }
   .ln { margin: 0; }
   .row { display: flex; justify-content: space-between; gap: 4mm; }
   .gap { height: 2mm; }
-  table { width: 100%; border-collapse: collapse; font-size: 7pt; margin-top: 1mm; table-layout: fixed; }
+  table { width: 100%; border-collapse: collapse; font-size: 8pt; margin-top: 1mm; table-layout: fixed; }
   th, td { border: 0.4pt solid #000; padding: 0.6mm 0.5mm; vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere; }
-  th { font-weight: 700; }
+  th { font-weight: 600; }
   col.sr { width: 4mm; } col.qty { width: 8mm; } col.rate { width: 10mm; } col.disc { width: 10mm; } col.drate { width: 11mm; } col.tot { width: 11mm; }
-  .total { font-weight: 700; font-size: 11pt; margin-top: 1.5mm; }
-  .words { font-size: 7pt; margin-top: 0.5mm; }
-  .footer { font-size: 7pt; margin-top: 2mm; }
+  .total { font-weight: 600; font-size: 12pt; margin-top: 1.5mm; }
+  .words { font-size: 8pt; margin-top: 0.5mm; }
+  .footer { font-size: 8pt; margin-top: 2mm; }
 </style>
 </head>
 <body>

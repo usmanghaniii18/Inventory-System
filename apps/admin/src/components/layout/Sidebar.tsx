@@ -22,6 +22,11 @@ export function Sidebar({
   const pathname = usePathname();
   const router = useRouter();
   const items = navForRole(role);
+  // Cashiers have no Dashboard access, so the brand/logo must NOT lead there —
+  // it lands them on POS billing instead (their home). Owner/manager keep the
+  // Dashboard as home. The Dashboard route is also blocked server-side in
+  // middleware, so this is defence-in-depth, not the only guard.
+  const homeHref = role === "cashier" ? "/admin/pos" : "/admin/dashboard";
 
   // Warm a tab's full RSC payload the moment the user shows intent (hover/focus),
   // so the actual click resolves from the client router cache instantly. Next's
@@ -48,7 +53,7 @@ export function Sidebar({
       >
         {/* Brand */}
         <div className="flex h-16 items-center justify-between px-5">
-          <Link href="/admin/dashboard" className="flex items-center gap-2.5">
+          <Link href={homeHref} className="flex items-center gap-2.5">
             {logoUrl ? (
               <div className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-xl bg-surface-2">
                 {/* eslint-disable-next-line @next/next/no-img-element */}

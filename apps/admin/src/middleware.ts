@@ -2,6 +2,30 @@ import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { verifyOtpSession, OTP_COOKIE } from "@/lib/otp";
 
+// Route → allowed roles. MUST mirror the `roles` in components/layout/nav.ts so
+// the server guard and the visible nav never diverge. Anything not listed here
+// is open to every signed-in staff role (POS, Sales, Products, Customers).
+const OWNER_MANAGER_ONLY = [
+  "/admin/dashboard", "/admin/categories", "/admin/stock", "/admin/purchasing",
+  "/admin/orders", "/admin/storefront", "/admin/discounts", "/admin/reports",
+];
+const OWNER_ONLY = ["/admin/settings"];
+
+const underAny = (pathname: string, prefixes: string[]) =>
+  prefixes.some((p) => pathname === p || pathname.startsWith(p + "/"));
+
+/** True when the path is restricted to a subset of roles (needs a role check). */
+function isRestricted(pathname: string): boolean {
+  return underAny(pathname, OWNER_MANAGER_ONLY) || underAny(pathname, OWNER_ONLY);
+}
+
+/** Whether `role` may access a (restricted) `pathname`. */
+function roleAllowed(pathname: string, role: string): boolean {
+  if (underAny(pathname, OWNER_ONLY)) return role === "owner";
+  if (underAny(pathname, OWNER_MANAGER_ONLY)) return role === "owner" || role === "manager";
+  return true;
+}
+
 /** Refreshes the Supabase auth session on every request and guards /admin/*.
  *  Full admin access requires BOTH a Supabase session AND a valid OTP-verified
  *  cookie (the 2nd factor, set after the emailed code is confirmed). */
@@ -54,6 +78,24 @@ export async function middleware(request: NextRequest) {
     const url = request.nextUrl.clone();
     url.pathname = "/admin/dashboard";
     return NextResponse.redirect(url);
+  }
+
+  // Role-gate admin routes server-side (mirrors nav.ts). A cashier must never
+  // reach the Dashboard or other owner/manager-only areas (sales/profit/stock
+  // value, etc.) even by typing the URL — hiding the nav item is not enough.
+  // Only the check is done here (a single indexed lookup, and only when the
+  // path is actually restricted) so ordinary cashier pages stay fast.
+  if (fullyAuthed && isAdminRoute && isRestricted(pathname)) {
+    const { data: profile } = await supabase
+      .from("profiles").select("role").eq("id", user!.id).maybeSingle();
+    const role = (profile?.role as string | undefined) ?? "owner";
+    if (!roleAllowed(pathname, role)) {
+      const url = request.nextUrl.clone();
+      // Send them to their own home (POS billing) rather than the blocked page.
+      url.pathname = "/admin/pos";
+      url.search = "";
+      return NextResponse.redirect(url);
+    }
   }
 
   return response;

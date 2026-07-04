@@ -82,8 +82,16 @@ describe("receiptHtml (80mm thermal sizing)", () => {
   it("starts at the very top and has no top/bottom padding band", () => {
     const html = receiptHtml(base);
     expect(html).toMatch(/padding:\s*0\s+3\.5mm\s+0;/); // .receipt: no top/bottom pad
-    expect(html).toContain("-webkit-text-stroke"); // bold-everywhere faux weight
     expect(html).toMatch(/print-color-adjust:\s*exact/);
+  });
+
+  it("uses a clean sans-serif font at a light bold weight (no monospace / faux-bold)", () => {
+    const html = receiptHtml(base);
+    expect(html).toMatch(/font-family:\s*Arial[^;]*sans-serif/); // clean sans-serif
+    expect(html).not.toContain("monospace"); // no typewriter/dotted look
+    expect(html).not.toContain("-webkit-text-stroke"); // no heavy faux weight
+    expect(html).not.toContain("text-shadow"); // no faux-bold thickening
+    expect(html).toContain("font-weight: 500"); // light bold body
   });
 
   it("grows with more items (multi-item taller than 1-item)", () => {

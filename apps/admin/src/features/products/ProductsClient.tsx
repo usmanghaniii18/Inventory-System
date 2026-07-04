@@ -19,7 +19,7 @@ import { EmptyState } from "@hamza/shared/ui/EmptyState";
 import { useToast } from "@hamza/shared/ui/Toast";
 import { ExportMenu } from "@hamza/shared/ui/ExportMenu";
 import { cn, formatPKR } from "@hamza/shared/utils";
-import { createProduct, updateProduct, updateVariant, bulkSetPrice, searchProducts, setProductActive, permanentlyDeleteProduct, uploadProductImage, uploadVariantImage, removeVariantImage, getVariantCostContext, correctVariantCost, type ProductInput, type VariantInput, type VariantCostContext } from "./actions";
+import { createProduct, updateProduct, updateVariant, bulkSetPrice, searchProducts, searchAllProducts, setProductActive, permanentlyDeleteProduct, uploadProductImage, uploadVariantImage, removeVariantImage, getVariantCostContext, correctVariantCost, type ProductInput, type VariantInput, type VariantCostContext } from "./actions";
 
 const UNIT_OPTIONS = ["pcs", "kg", "g", "litre", "ml", "pack", "dozen", "box", "metre"];
 import { PRODUCTS_PAGE_SIZE, type ProductRow, type VariantRow, type ProductsPage } from "@/lib/products-query";
@@ -227,12 +227,13 @@ export function ProductsClient({
     return () => io.disconnect();
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
-  // Export reflects the full filtered set, not just the loaded pages.
+  // Export reflects the full filtered set, not just the loaded pages. Pages
+  // through the ENTIRE catalogue server-side (no silent 1000-row cap).
   const fetchExportRows = useCallback(async () => {
-    const page = await searchProducts({
-      q: debouncedQ || undefined, categoryId: cat || undefined, offset: 0, limit: 10_000,
+    const { rows } = await searchAllProducts({
+      q: debouncedQ || undefined, categoryId: cat || undefined,
     });
-    return page.rows.flatMap((p) =>
+    return rows.flatMap((p) =>
       p.variants.map((v) => ({
         product: p.name, brand: p.brand ?? "", category: p.category, variant: v.label,
         sku: v.sku, barcode: v.barcode ?? "", cost: Math.round(v.avg_cost || v.cost),

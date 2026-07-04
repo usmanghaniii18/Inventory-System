@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@hamza/shared/supabase/admin";
 import { createClient } from "@hamza/shared/supabase/server";
 import { getCurrentUser } from "@hamza/shared/auth";
-import { fetchProductsPage, type ProductsQuery, type ProductsPage } from "@/lib/products-query";
+import { fetchProductsPage, fetchAllProducts, type ProductsQuery, type ProductsPage, type ProductRow } from "@/lib/products-query";
 import { generateInternalEan13, generateWeightTemplateEan13 } from "@/lib/barcode";
 import { productInputSchema, variantPatchSchema, importRowsSchema, firstIssue } from "@hamza/shared/validation";
 import type { ParsedProductRow } from "@/lib/csv";
@@ -17,6 +17,16 @@ import type { ParsedProductRow } from "@/lib/csv";
 export async function searchProducts(params: ProductsQuery): Promise<ProductsPage> {
   const supabase = await createClient();
   return fetchProductsPage(supabase, params);
+}
+
+/**
+ * Full (optionally filtered) product set for export — pages through the ENTIRE
+ * catalogue server-side so the export never stops at PostgREST's 1000-row cap
+ * (loads up to 15,000+ products with nothing dropped).
+ */
+export async function searchAllProducts(params: Pick<ProductsQuery, "q" | "categoryId">): Promise<{ rows: ProductRow[] }> {
+  const supabase = await createClient();
+  return { rows: await fetchAllProducts(supabase, params) };
 }
 
 function slugify(s: string) {

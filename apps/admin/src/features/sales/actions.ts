@@ -218,11 +218,20 @@ export async function getSaleDetail(saleId: string): Promise<SaleDetail | { erro
 }
 
 /**
- * Rebuild the bill as a ReceiptData for the shared invoice template. When
- * `netOfReturns` is true (default) the receipt reflects ONLY the remaining
- * (un-returned) items and the recomputed total — i.e. the UPDATED bill after a
- * return. Returned-in-full lines drop off; partially returned lines show the
- * remaining qty.
+ * Rebuild a saved bill as a ReceiptData for the shared invoice template.
+ *
+ * By default this reproduces the ORIGINAL sale EXACTLY from the figures persisted
+ * at sale time — the stored per-line unit price, line total (and the discount
+ * derived from them) plus the sale's own stored subtotal / total discount / tax /
+ * net total. Nothing is recomputed from current product or discount settings, so
+ * a reprint byte-matches the original no matter how much later it is printed, and
+ * regardless of any later product/discount changes.
+ *
+ * The one exception is a bill that has since been RETURNED (in part or in full):
+ * when `netOfReturns` is true (the default) such a bill is re-rendered as the
+ * UPDATED bill — returned-in-full lines drop off, partially returned lines show
+ * the remaining qty, and the total reflects the net of refunds. An un-returned
+ * bill always reads straight from the stored figures.
  */
 export async function getSaleReceiptData(saleId: string, netOfReturns = true): Promise<ReceiptData | { error: string }> {
   const detail = await getSaleDetail(saleId);
@@ -230,27 +239,9 @@ export async function getSaleReceiptData(saleId: string, netOfReturns = true): P
   const db = createAdminClient();
   const { data: settings } = await db.from("settings").select("store_name, tax_percent, store_info").eq("id", 1).maybeSingle();
   const info = (settings?.store_info ?? {}) as Record<string, string | undefined>;
-
-  const lines = detail.items.filter((it) => (netOfReturns ? it.remaining : it.qty) > 0);
-  const items: ReceiptItem[] = lines.map((it) => {
-    const qty = netOfReturns ? it.remaining : it.qty;
-    const perUnitDiscount = it.qty > 0 ? it.line_discount / it.qty : 0;
-    return {
-      name: it.name, label: it.label || undefined, qty, unit: it.unit,
-      unit_price: it.unit_price, discount: round2(perUnitDiscount * qty),
-      line_total: round2(qty * it.unit_price - perUnitDiscount * qty),
-    };
-  });
-
-  const subtotal = round2(items.reduce((s, it) => s + it.qty * it.unit_price, 0));
-  const lineDiscount = round2(items.reduce((s, it) => s + (it.discount ?? 0), 0));
-  // Keep the original bill-level discount only when nothing was returned; once
-  // items come off, the line-level math already reflects the new total.
-  const billDiscount = netOfReturns && detail.refunded_total > 0 ? 0 : detail.discount;
   const taxPercent = Number(settings?.tax_percent ?? 0);
-  const total = netOfReturns ? round2(detail.net_total) : detail.total;
 
-  return {
+  const meta = {
     store: {
       name: settings?.store_name ?? "Hamza General Store",
       address: info.address, phone: info.phone, ntn: info.ntn, logo_url: info.logo_url,
@@ -261,13 +252,44 @@ export async function getSaleReceiptData(saleId: string, netOfReturns = true): P
     cashier: detail.cashier_name ?? "Cashier",
     customer: detail.customer_name,
     customer_address: null,
-    items,
-    subtotal,
-    discount: round2(lineDiscount + billDiscount),
-    tax: detail.tax,
     tax_percent: taxPercent,
-    total,
     payments: detail.payments,
     change: 0,
+  };
+
+  // Only re-render as an "updated bill" when this sale actually has returns.
+  const applyReturns = netOfReturns && detail.refunded_total > 0;
+
+  if (!applyReturns) {
+    // EXACT original bill — every figure straight from what was persisted at sale
+    // time. Per line: stored unit price, stored line total, and the discount is
+    // exactly (qty × unit_price − line_total) as recorded. Totals are the sale's
+    // own stored subtotal / discount / tax / total (never recomputed).
+    const items: ReceiptItem[] = detail.items.map((it) => ({
+      name: it.name, label: it.label || undefined, qty: it.qty, unit: it.unit,
+      unit_price: it.unit_price, discount: it.line_discount, line_total: it.line_total,
+    }));
+    return {
+      ...meta, items,
+      subtotal: detail.subtotal, discount: detail.discount, tax: detail.tax, total: detail.total,
+    };
+  }
+
+  // Updated bill after a return — reflect only the remaining (un-returned) qty and
+  // the net-of-refunds total. Line discounts are prorated to the remaining qty.
+  const lines = detail.items.filter((it) => it.remaining > 0);
+  const items: ReceiptItem[] = lines.map((it) => {
+    const perUnitDiscount = it.qty > 0 ? it.line_discount / it.qty : 0;
+    return {
+      name: it.name, label: it.label || undefined, qty: it.remaining, unit: it.unit,
+      unit_price: it.unit_price, discount: round2(perUnitDiscount * it.remaining),
+      line_total: round2(it.remaining * it.unit_price - perUnitDiscount * it.remaining),
+    };
+  });
+  const subtotal = round2(items.reduce((s, it) => s + it.qty * it.unit_price, 0));
+  const discount = round2(items.reduce((s, it) => s + (it.discount ?? 0), 0));
+  return {
+    ...meta, items,
+    subtotal, discount, tax: detail.tax, total: round2(detail.net_total),
   };
 }
