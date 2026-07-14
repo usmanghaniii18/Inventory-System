@@ -27,7 +27,7 @@ export default async function StockPage() {
       .from("product_variants")
       .select("id, product_id, sku, reorder_point, is_default, products(name, base_unit, category_id, active), product_barcodes(barcode, is_primary)")
       .eq("active", true).order("id").range(from, to)),
-    supabase.from("categories").select("id, name, parent_id"),
+    supabase.from("categories").select("id, name, parent_id, sort").order("sort").order("name"),
     selectAll((from, to) => supabase.from("variant_availability").select("variant_id, on_hand, reserved, available, avg_cost").order("variant_id").range(from, to)),
     selectAll((from, to) => supabase.from("stock_levels").select("variant_id, location_id, on_hand").order("variant_id").order("location_id").range(from, to)),
     supabase.from("locations").select("id, code, name, type").eq("type", "PHYSICAL").order("code"),
@@ -99,10 +99,24 @@ export default async function StockPage() {
     };
   }).sort((a, b) => a.product_name.localeCompare(b.product_name) || a.label.localeCompare(b.label));
 
-  const cats = (categories ?? []).filter((c) => rows.some((r) => r.category_id === c.id));
-  const catOptions = cats
-    .map((c) => ({ id: c.id, name: c.parent_id ? `${catName.get(c.parent_id) ?? "?"} › ${c.name}` : c.name }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  // A category is offered in the filter if it (or, for a main category, any of
+  // its sub-categories) actually has products — same rollup as the product
+  // count, so a main category with only sub-categorised products still shows up.
+  const allCats = (categories ?? []) as { id: string; name: string; parent_id: string | null }[];
+  const directCatIds = new Set(rows.map((r) => r.category_id).filter(Boolean) as string[]);
+  const childrenOf = new Map<string, string[]>();
+  for (const c of allCats) if (c.parent_id) childrenOf.set(c.parent_id, [...(childrenOf.get(c.parent_id) ?? []), c.id]);
+  const hasProductsCache = new Map<string, boolean>();
+  const hasProducts = (id: string): boolean => {
+    const cached = hasProductsCache.get(id);
+    if (cached !== undefined) return cached;
+    const result = directCatIds.has(id) || (childrenOf.get(id) ?? []).some(hasProducts);
+    hasProductsCache.set(id, result);
+    return result;
+  };
+  const catOptions = allCats
+    .filter((c) => hasProducts(c.id))
+    .map((c) => ({ id: c.id, name: c.name, parent_id: c.parent_id }));
 
   const locOptions: PhysLocation[] = physLocs.map((l) => ({ code: l.code, name: l.name }));
 

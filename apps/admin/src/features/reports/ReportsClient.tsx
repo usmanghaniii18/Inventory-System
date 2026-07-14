@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { BarChart3 } from "lucide-react";
 import { PageHeader } from "@hamza/shared/ui/PageHeader";
 import { Card, CardHeader, CardTitle } from "@hamza/shared/ui/Card";
@@ -12,6 +12,7 @@ import { EmptyState } from "@hamza/shared/ui/EmptyState";
 import { FilterBar } from "@hamza/shared/ui/FilterBar";
 import { ExportMenu } from "@hamza/shared/ui/ExportMenu";
 import { AreaTrend, BarTrend, DonutChart } from "@/components/charts";
+import { CategoryMultiSelect } from "@/components/CategoryMultiSelect";
 import { formatPKR, formatNumber, cn } from "@hamza/shared/utils";
 import { REPORTS, type ReportData, type ReportColumn, type ReportChart } from "./queries";
 
@@ -27,6 +28,8 @@ function fmt(kind: ReportColumn["kind"], v: unknown) {
 
 export function ReportsClient({ reportKey, data }: { reportKey: string; data: ReportData }) {
   const params = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
 
   // tab links preserve the date range, reset per-report view
   const tabHref = (key: string) => {
@@ -34,6 +37,13 @@ export function ReportsClient({ reportKey, data }: { reportKey: string; data: Re
     for (const k of ["preset", "from", "to"]) { const v = params.get(k); if (v) next.set(k, v); }
     next.set("report", key);
     return `/admin/reports?${next.toString()}`;
+  };
+
+  const selectedCategoryIds = (params.get("categories") ?? "").split(",").filter(Boolean);
+  const setCategoryIds = (ids: string[]) => {
+    const next = new URLSearchParams(params.toString());
+    if (ids.length) next.set("categories", ids.join(",")); else next.delete("categories");
+    router.push(`${pathname}?${next.toString()}`);
   };
 
   const columns: Column<Record<string, unknown> & { id: number }>[] = data.columns.map((c) => ({
@@ -82,7 +92,19 @@ export function ReportsClient({ reportKey, data }: { reportKey: string; data: Re
         ))}
       </div>
 
-      <FilterBar dimensions={data.dimensions} className="mb-4" />
+      <FilterBar dimensions={data.dimensions} className={data.categoryFilter ? "mb-3" : "mb-4"} />
+
+      {data.categoryFilter && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface p-3">
+          <span className="text-sm text-text-tertiary">Categories</span>
+          <CategoryMultiSelect
+            categories={data.categoryFilter.options}
+            selected={selectedCategoryIds}
+            onChange={setCategoryIds}
+            className="w-64"
+          />
+        </div>
+      )}
 
       {/* KPIs */}
       <div className={cn("mb-4 grid grid-cols-2 gap-4", data.kpis.length >= 6 ? "lg:grid-cols-6" : "lg:grid-cols-4")}>

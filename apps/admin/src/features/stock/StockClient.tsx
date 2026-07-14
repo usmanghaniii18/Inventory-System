@@ -24,8 +24,10 @@ import {
   stockIn, adjustStock, transferStock, cycleCount, getMovementHistory, type MoveRow,
 } from "./actions";
 import { useScanHandler } from "@/components/scan/ScanProvider";
+import { CategoryMultiSelect, type CategoryOption } from "@/components/CategoryMultiSelect";
 import { parseScan } from "@/lib/barcode";
 import { ensureCatalog, lookupBarcodeLoose } from "@/lib/catalog-cache";
+import { expandCategorySelection } from "@/lib/categories";
 import { beepOk, beepError } from "@/lib/sound";
 
 export interface PhysLocation { code: string; name: string }
@@ -63,7 +65,7 @@ export function StockClient({
   rows, categories, locations,
 }: {
   rows: StockRow[];
-  categories: { id: string; name: string }[];
+  categories: CategoryOption[];
   locations: PhysLocation[];
 }) {
   const router = useRouter();
@@ -71,7 +73,9 @@ export function StockClient({
   const sp = useSearchParams();
   const toast = useToast();
   const [q, setQ] = useState("");
-  const [cat, setCat] = useState("");
+  const [catIds, setCatIds] = useState<string[]>([]);
+  // Selecting a main category must also match its sub-categories' products.
+  const expandedCats = useMemo(() => expandCategorySelection(catIds, categories), [catIds, categories]);
   // Honor a ?filter=low_stock deep link from the dashboard "Low Stock → See all".
   const initialFilter = sp.get("filter");
   const [status, setStatus] = useState<StatusFilter>(
@@ -107,7 +111,7 @@ export function StockClient({
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
     return rows.filter((r) => {
-      if (cat && r.category_id !== cat) return false;
+      if (catIds.length && (!r.category_id || !expandedCats.has(r.category_id))) return false;
       if (status !== "all" && rowStatus(r) !== status) return false;
       if (loc && !(r.byLocation.find((l) => l.code === loc)?.on_hand)) return false;
       if (!term) return true;
@@ -118,7 +122,7 @@ export function StockClient({
         (r.barcode ?? "").includes(term)
       );
     });
-  }, [rows, q, cat, status, loc]);
+  }, [rows, q, catIds, expandedCats, status, loc]);
 
   const totalValue = rows.reduce((s, r) => s + r.value, 0);
   const lowCount = rows.filter((r) => rowStatus(r) === "low_stock").length;
@@ -186,10 +190,7 @@ export function StockClient({
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-tertiary" />
           <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search product, variant, SKU or barcode…" className="pl-9" />
         </div>
-        <Select value={cat} onChange={(e) => setCat(e.target.value)} className="lg:w-52">
-          <option value="">All categories</option>
-          {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </Select>
+        <CategoryMultiSelect categories={categories} selected={catIds} onChange={setCatIds} className="lg:w-52" />
         <Select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)} className="lg:w-40">
           <option value="all">All statuses</option>
           <option value="in_stock">In stock</option>

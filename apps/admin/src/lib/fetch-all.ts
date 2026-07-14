@@ -39,3 +39,23 @@ export async function selectAll<T>(
 ): Promise<{ data: T[] }> {
   return { data: await fetchAll<T>(build, page) };
 }
+
+// A single `.in("col", ids)` with hundreds of ids builds a URL/header long enough
+// to exceed PostgREST's/the proxy's header-size limit (empirically ~450+ uuids),
+// which fails the request outright rather than truncating it. Chunk the id list
+// so no single request's `.in()` list grows unbounded, and paginate each chunk.
+const ID_CHUNK = 150;
+
+/** Fetch every row matching a (possibly huge) list of ids, chunked + paginated. */
+export async function fetchAllByIds<T>(
+  ids: string[],
+  build: (chunk: string[], from: number, to: number) => PromiseLike<QueryResult<T>>,
+  chunkSize = ID_CHUNK,
+): Promise<T[]> {
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    out.push(...(await fetchAll<T>((from, to) => build(chunk, from, to))));
+  }
+  return out;
+}

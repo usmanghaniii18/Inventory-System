@@ -2,7 +2,8 @@ import type { createClient } from "@hamza/shared/supabase/server";
 import type { Accent } from "@hamza/shared/ui/accent";
 import type { DimensionFilter } from "@hamza/shared/ui/FilterBar";
 import { getVariantOptions, getVariantNames } from "@/lib/catalog";
-import { fetchAll, selectAll } from "@/lib/fetch-all";
+import { fetchAll, selectAll, fetchAllByIds } from "@/lib/fetch-all";
+import { expandCategorySelection } from "@/lib/categories";
 import { formatPKR, formatNumber } from "@hamza/shared/utils";
 import { bucketKey, bucketOf, type DateRange } from "@hamza/shared/dates";
 import { format } from "date-fns";
@@ -21,6 +22,7 @@ export interface ReportChart {
   centerLabel?: string;
   centerValue?: string;
 }
+export interface CategoryFilterOption { id: string; name: string; parent_id: string | null }
 export interface ReportData {
   key: string;
   title: string;
@@ -30,6 +32,8 @@ export interface ReportData {
   columns: ReportColumn[];
   rows: Record<string, unknown>[];
   dimensions: DimensionFilter[];
+  /** Multi-select category (main + sub, rollup) filter — currently Inventory Valuation only. */
+  categoryFilter?: { options: CategoryFilterOption[] };
 }
 
 export const REPORTS: { key: string; label: string }[] = [
@@ -60,7 +64,7 @@ function trend(range: DateRange, rows: { created_at: string; value: number }[], 
 export async function buildReport(supabase: Supabase, key: string, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   switch (key) {
     case "profit": return profitReport(supabase, range);
-    case "inventory": return inventoryReport(supabase, range);
+    case "inventory": return inventoryReport(supabase, range, params);
     case "stockin": return stockInReport(supabase, range, params);
     case "products": return productsReport(supabase, range, params);
     case "purchases": return purchasesReport(supabase, range);
@@ -73,16 +77,29 @@ export async function buildReport(supabase: Supabase, key: string, range: DateRa
 }
 
 /* ---------------- shared fetch ---------------- */
+// Both queries are paginated (fetchAll) so no range is silently capped at
+// PostgREST's 1000-row default. sale_items is filtered directly on the parent
+// sale's date via the FK embed (`sales!inner`) rather than an `.in("sale_id",
+// ids)` list — with a few hundred+ sales that id list builds a URL/header long
+// enough to blow past PostgREST's/the proxy's size limit and fail outright,
+// which is why wide custom ranges previously showed no data at all.
 async function fetchSales(supabase: Supabase, range: DateRange) {
-  const { data: sales } = await supabase
+  const sales = await fetchAll<{
+    id: string; total: number; discount: number; tax: number; cogs_total: number;
+    profit: number; created_at: string; cashier_id: string | null; customer_id: string | null;
+  }>((from, to) => supabase
     .from("sales")
     .select("id, total, discount, tax, cogs_total, profit, created_at, cashier_id, customer_id")
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to));
-  const ids = (sales ?? []).map((s) => s.id);
-  const { data: items } = ids.length
-    ? await supabase.from("sale_items").select("sale_id, variant_id, product_id, qty, unit_price, unit_cogs, line_total").in("sale_id", ids)
-    : { data: [] as Record<string, unknown>[] };
-  return { sales: sales ?? [], items: (items ?? []) as Record<string, unknown>[] };
+    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+    .order("id").range(from, to));
+
+  const items = await fetchAll<Record<string, unknown>>((from, to) => supabase
+    .from("sale_items")
+    .select("sale_id, variant_id, product_id, qty, unit_price, unit_cogs, line_total, sales!inner(created_at)")
+    .gte("sales.created_at", iso(range.from)).lte("sales.created_at", iso(range.to))
+    .order("id").range(from, to));
+
+  return { sales, items };
 }
 
 /**
@@ -103,29 +120,39 @@ interface ReturnsAgg {
   byCashier: Map<string, { revenue: number; profit: number }>;
 }
 async function fetchReturns(supabase: Supabase, range: DateRange): Promise<ReturnsAgg> {
-  const { data: returns } = await supabase
+  const returns = await fetchAll<{
+    id: string; created_at: string;
+    sales: { customer_id: string | null; cashier_id: string | null } | { customer_id: string | null; cashier_id: string | null }[] | null;
+  }>((from, to) => supabase
     .from("sale_returns").select("id, created_at, sales(customer_id, cashier_id)")
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to));
-  const ids = (returns ?? []).map((r) => r.id);
-  const { data: items } = ids.length
-    ? await supabase.from("sale_return_items").select("return_id, variant_id, qty, line_total, unit_cogs").in("return_id", ids)
-    : { data: [] as Record<string, unknown>[] };
-  const dateOf = new Map((returns ?? []).map((r) => [r.id as string, r.created_at as string]));
+    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+    .order("id").range(from, to));
+  // Filtered directly on the parent return's date via the FK embed — same reason
+  // as fetchSales/sale_items above, avoids an `.in("return_id", ids)` list that
+  // can blow past PostgREST's URL/header limit once returns run into the hundreds.
+  const items = await fetchAll<{
+    return_id: string; variant_id: string | null; qty: number; line_total: number; unit_cogs: number;
+  }>((from, to) => supabase
+    .from("sale_return_items")
+    .select("return_id, variant_id, qty, line_total, unit_cogs, sale_returns!inner(created_at)")
+    .gte("sale_returns.created_at", iso(range.from)).lte("sale_returns.created_at", iso(range.to))
+    .order("id").range(from, to));
+  const dateOf = new Map(returns.map((r) => [r.id, r.created_at]));
   // each return -> the customer / cashier of the sale it reverses (embedded join)
   const custOf = new Map<string, string | null>();
   const cashOf = new Map<string, string | null>();
-  for (const r of returns ?? []) {
-    const rel = (r as Record<string, unknown>).sales;
-    const s = (Array.isArray(rel) ? rel[0] : rel) as { customer_id: string | null; cashier_id: string | null } | null;
-    custOf.set(r.id as string, s?.customer_id ?? null);
-    cashOf.set(r.id as string, s?.cashier_id ?? null);
+  for (const r of returns) {
+    const rel = r.sales;
+    const s = Array.isArray(rel) ? rel[0] : rel;
+    custOf.set(r.id, s?.customer_id ?? null);
+    cashOf.set(r.id, s?.cashier_id ?? null);
   }
   const byVariant = new Map<string, { qty: number; revenue: number; cogs: number; profit: number }>();
   const perReturn = new Map<string, { created_at: string; revenue: number; profit: number }>();
   const byCustomer = new Map<string, { revenue: number; profit: number }>();
   const byCashier = new Map<string, { revenue: number; profit: number }>();
   let totalRevenue = 0, totalCogs = 0;
-  for (const it of items ?? []) {
+  for (const it of items) {
     const rev = Number(it.line_total); const cogs = Number(it.qty) * Number(it.unit_cogs); const prof = rev - cogs;
     totalRevenue += rev; totalCogs += cogs;
     const vid = it.variant_id as string | null;
@@ -152,18 +179,29 @@ async function fetchReturns(supabase: Supabase, range: DateRange): Promise<Retur
  */
 interface WebTxn { id: string; total: number; profit: number; cogs: number; created_at: string }
 async function fetchWebOrders(supabase: Supabase, range: DateRange): Promise<WebTxn[]> {
-  const { data: orders } = await supabase
+  const orders = await fetchAll<{ id: string; total: number; created_at: string }>((from, to) => supabase
     .from("orders")
     .select("id, total, created_at")
     .in("status", ["SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED"])
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to));
-  const ids = (orders ?? []).map((o) => o.id);
-  const { data: moves } = ids.length
-    ? await supabase.from("stock_moves").select("reference_id, qty, unit_cost").eq("reference_type", "SALE").in("reference_id", ids)
-    : { data: [] as { reference_id: string; qty: number; unit_cost: number | null }[] };
+    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+    .order("id").range(from, to));
+  const ids = orders.map((o) => o.id);
+  // stock_moves.reference_id is a polymorphic pointer (no FK — it's reused for
+  // PURCHASE/ADJUSTMENT/etc reference types too), so it can't be embed-filtered
+  // like sale_items/sale_return_items above. Chunk the id list instead so the
+  // `.in()` URL never grows past PostgREST's header-size limit.
+  const moves = ids.length
+    ? await fetchAllByIds<{ reference_id: string; qty: number; unit_cost: number | null }>(
+        ids,
+        (chunk, from, to) => supabase.from("stock_moves")
+          .select("reference_id, qty, unit_cost")
+          .eq("reference_type", "SALE").in("reference_id", chunk)
+          .order("id").range(from, to),
+      )
+    : [];
   const cogs = new Map<string, number>();
-  for (const m of moves ?? []) cogs.set(m.reference_id, (cogs.get(m.reference_id) ?? 0) + Number(m.qty) * Number(m.unit_cost ?? 0));
-  return (orders ?? []).map((o) => {
+  for (const m of moves) cogs.set(m.reference_id, (cogs.get(m.reference_id) ?? 0) + Number(m.qty) * Number(m.unit_cost ?? 0));
+  return orders.map((o) => {
     const c = cogs.get(o.id) ?? 0;
     return { id: o.id, total: Number(o.total), cogs: c, profit: Number(o.total) - c, created_at: o.created_at };
   });
@@ -232,11 +270,15 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
     ];
     rows = [...agg.values()].sort((a, b) => b.sales - a.sales);
   } else if (groupBy === "payment") {
-    const { data: pays } = sales.length
-      ? await supabase.from("payments").select("method, amount, sale_id").in("sale_id", sales.map((s) => s.id))
-      : { data: [] as { method: string; amount: number }[] };
+    // Filtered directly on the parent sale's date via the FK embed rather than an
+    // `.in("sale_id", ids)` list — same URL/header-limit issue as fetchSales above.
+    const pays = await fetchAll<{ method: string; amount: number }>((from, to) => supabase
+      .from("payments")
+      .select("method, amount, sales!inner(created_at)")
+      .gte("sales.created_at", iso(range.from)).lte("sales.created_at", iso(range.to))
+      .order("id").range(from, to));
     const agg = new Map<string, number>();
-    for (const p of pays ?? []) agg.set(p.method, (agg.get(p.method) ?? 0) + Number(p.amount));
+    for (const p of pays) agg.set(p.method, (agg.get(p.method) ?? 0) + Number(p.amount));
     columns = [{ key: "name", header: "Payment type", kind: "text" }, { key: "amount", header: "Amount", align: "right", kind: "pkr" }];
     rows = [...agg.entries()].map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount);
   } else if (groupBy === "channel") {
@@ -345,10 +387,17 @@ async function profitReport(supabase: Supabase, range: DateRange): Promise<Repor
 }
 
 /* ---------------- 3. Inventory valuation (point-in-time) ---------------- */
-async function inventoryReport(supabase: Supabase, range: DateRange): Promise<ReportData> {
+async function inventoryReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   const variants = await getVariantOptions(supabase);
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
-  const catName = await categoryNames(supabase);
+  const cats = await categoryList(supabase);
+  const catName = new Map(cats.map((c) => [c.id, c.name]));
+
+  // Category filter (multi-select, main + sub). Empty selection = all
+  // categories (unchanged default behaviour). Selecting a main category rolls
+  // up to include its sub-categories, same as the Categories tab / Stock filter.
+  const selectedCats = (params.get("categories") ?? "").split(",").filter(Boolean);
+  const catScope = selectedCats.length ? expandCategorySelection(selectedCats, cats) : null;
 
   // reconstruct on-hand as of range.to from the ledger (physical legs only)
   const { data: physLocs } = await supabase.from("locations").select("id").eq("type", "PHYSICAL");
@@ -373,6 +422,7 @@ async function inventoryReport(supabase: Supabase, range: DateRange): Promise<Re
   for (const [vid, qty] of onHand) {
     const v = vMap.get(vid);
     if (!v) continue;
+    if (catScope && (!v.category_id || !catScope.has(v.category_id))) continue;
     const value = qty * v.cost;
     if (qty <= 0) outCount++;
     totalValue += value; totalUnits += qty;
@@ -401,6 +451,7 @@ async function inventoryReport(supabase: Supabase, range: DateRange): Promise<Re
       { key: "value", header: "Value", align: "right", kind: "pkr" },
     ],
     rows: rows.slice(0, 100), dimensions: [],
+    categoryFilter: { options: cats },
   };
 }
 
@@ -793,6 +844,10 @@ async function systemReport(supabase: Supabase, range: DateRange): Promise<Repor
 async function categoryNames(supabase: Supabase) {
   const { data } = await supabase.from("categories").select("id, name");
   return new Map((data ?? []).map((c) => [c.id, c.name]));
+}
+async function categoryList(supabase: Supabase): Promise<CategoryFilterOption[]> {
+  const { data } = await supabase.from("categories").select("id, name, parent_id").order("sort").order("name");
+  return (data ?? []) as CategoryFilterOption[];
 }
 async function profileNames(supabase: Supabase) {
   const { data } = await supabase.from("profiles").select("id, full_name");
