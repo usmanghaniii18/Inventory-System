@@ -68,6 +68,41 @@ export function netUnitPaid(lineTotal: number, qty: number, sumLineTotals: numbe
   return (lineTotal / qty) * (saleTotal / sumLineTotals);
 }
 
+export interface UdhaarRefundSplit {
+  /** Portion of the refund that must come off the customer's khata. */
+  udhaarPortion: number;
+  /** Whatever's left — follows the normal (chosen-method) refund path. */
+  remainder: number;
+}
+
+/**
+ * Split a return's net-paid refund between the customer's khata (for
+ * whatever share of the ORIGINAL bill was charged to udhaar) and the rest
+ * (cash/Easypaisa/JazzCash) — so a return of an udhaar sale reduces what the
+ * customer owes instead of leaving their khata untouched.
+ *
+ * `originalUdhaar` / `saleTotal` set the bill's udhaar fraction (0 for a bill
+ * with no udhaar payment — that returns the refund entirely as `remainder`,
+ * so non-udhaar returns are completely unaffected). The udhaar portion is
+ * capped by `alreadyRefundedUdhaar` (the sum of prior returns' udhaar
+ * portions for this same bill) so cumulative reversal can never exceed what
+ * that bill actually charged to the khata — a return can't push it negative.
+ */
+export function splitUdhaarRefund(params: {
+  refundTotal: number;
+  saleTotal: number;
+  originalUdhaar: number;
+  alreadyRefundedUdhaar: number;
+}): UdhaarRefundSplit {
+  const { refundTotal, saleTotal, originalUdhaar, alreadyRefundedUdhaar } = params;
+  if (originalUdhaar <= 0 || saleTotal <= 0) return { udhaarPortion: 0, remainder: round2(refundTotal) };
+  const udhaarFraction = Math.min(1, originalUdhaar / saleTotal);
+  const rawPortion = round2(refundTotal * udhaarFraction);
+  const cap = Math.max(0, round2(originalUdhaar - alreadyRefundedUdhaar));
+  const udhaarPortion = Math.max(0, Math.min(rawPortion, cap));
+  return { udhaarPortion, remainder: round2(refundTotal - udhaarPortion) };
+}
+
 /** Cash change = tendered − cash applied (never negative). */
 export function changeDue(tendered: number, cashApplied: number): number {
   return Math.max(0, round2((tendered || 0) - (cashApplied || 0)));

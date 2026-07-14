@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@hamza/shared/supabase/admin";
 import { getCurrentUser } from "@hamza/shared/auth";
 import { returnSchema, firstIssue } from "@hamza/shared/validation";
-import { netUnitPaid } from "@hamza/shared/pricing";
+import { netUnitPaid, splitUdhaarRefund } from "@hamza/shared/pricing";
 import type { PayMethod } from "./actions";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -192,18 +192,52 @@ export async function processReturn(input: {
   const { error: mErr } = await db.from("stock_moves").insert(moves);
   if (mErr) return { error: mErr.message };
 
-  // Refund: to khata (reduces what they owe) or as a negative payment (cash/card/etc.).
+  // Refund: whatever portion of the ORIGINAL bill was charged to the customer's
+  // khata must come back off it automatically — regardless of the chosen refund
+  // method — since handing back "cash" for money that was never paid in cash is
+  // wrong, and leaving the khata charge untouched leaves their balance too high.
+  // Only the portion of the bill originally paid in cash/Easypaisa/JazzCash (if
+  // any) follows the cashier's chosen refund method, exactly as before.
   const cid = input.customer_id || sale?.customer_id || null;
-  if (input.refund_method === "UDHAAR" && cid) {
+
+  const applyToKhata = async (amount: number, reference: string) => {
+    if (amount <= 0 || !cid) return;
     const { data: c } = await db.from("customers").select("credit_balance").eq("id", cid).single();
-    const newBal = Number(c?.credit_balance ?? 0) - total;
+    const newBal = round2(Number(c?.credit_balance ?? 0) - amount);
     await db.from("customer_ledger").insert({
-      customer_id: cid, type: "PAYMENT", amount: total, reference: `Return ${input.receipt_no}`,
-      balance_after: newBal, created_by: user.id,
+      customer_id: cid, type: "PAYMENT", amount, reference, balance_after: newBal, created_by: user.id,
     });
     await db.from("customers").update({ credit_balance: newBal }).eq("id", cid);
-  } else {
-    await db.from("payments").insert({ sale_id: input.sale_id, method: input.refund_method, amount: -total });
+  };
+
+  const { data: origPays } = cid ? await db.from("payments").select("method, amount").eq("sale_id", input.sale_id) : { data: [] as { method: string; amount: number }[] };
+  const origUdhaar = (origPays ?? []).filter((p) => p.method === "UDHAAR").reduce((s, p) => s + Number(p.amount), 0);
+
+  // Cap at what's still outstanding from THIS bill's own udhaar charge — a
+  // return can never reverse more than that bill originally put on the khata,
+  // even if an earlier (pre-fix) return already over-credited it.
+  const { data: priorRefunds } = cid && origUdhaar > 0
+    ? await db.from("customer_ledger").select("amount").eq("customer_id", cid).eq("type", "PAYMENT").eq("reference", `Return ${input.receipt_no}`)
+    : { data: [] as { amount: number }[] };
+  const alreadyRefunded = (priorRefunds ?? []).reduce((s, r) => s + Number(r.amount), 0);
+
+  const { udhaarPortion, remainder } = cid
+    ? splitUdhaarRefund({ refundTotal: total, saleTotal, originalUdhaar: origUdhaar, alreadyRefundedUdhaar: alreadyRefunded })
+    : { udhaarPortion: 0, remainder: total };
+  await applyToKhata(udhaarPortion, `Return ${input.receipt_no}`);
+
+  // Whatever's left (all of it, for a bill with no original udhaar — unchanged
+  // path) follows the cashier's chosen refund method.
+  if (remainder > 0) {
+    if (input.refund_method === "UDHAAR" && cid) {
+      // A separate reference from the bill-linked reversal above, so a cashier
+      // choosing to also convert this leftover into store credit never counts
+      // against — and so never shrinks — this bill's own udhaar-reversal cap.
+      const reference = origUdhaar > 0 ? `Return ${input.receipt_no} (extra, converted to khata)` : `Return ${input.receipt_no}`;
+      await applyToKhata(remainder, reference);
+    } else {
+      await db.from("payments").insert({ sale_id: input.sale_id, method: input.refund_method, amount: -remainder });
+    }
   }
 
   revalidatePath("/admin/stock");
