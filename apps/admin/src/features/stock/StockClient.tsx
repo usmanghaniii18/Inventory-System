@@ -132,7 +132,7 @@ export function StockClient({
     <div className="min-w-0">
       <PageHeader
         title="Stock"
-        subtitle="Live on-hand levels per variant — every change is a recorded movement"
+        subtitle="Current on-hand levels per variant — every change is a recorded movement"
         actions={
           <div className="flex flex-wrap gap-2">
             <ExportMenu

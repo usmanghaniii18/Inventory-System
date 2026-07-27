@@ -105,7 +105,7 @@ export function StorefrontClient({ rows }: { rows: ListingRow[] }) {
 
       <Card><DataTable columns={columns} rows={filtered} /></Card>
       <p className="mt-3 text-center text-xs text-text-tertiary">
-        The customer storefront (next phase) reads these published listings live from the same database.
+        The customer storefront reads these published listings from the same database (product pages refresh at least every 30 seconds).
       </p>
     </div>
   );

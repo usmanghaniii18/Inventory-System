@@ -68,6 +68,20 @@ export function netUnitPaid(lineTotal: number, qty: number, sumLineTotals: numbe
   return (lineTotal / qty) * (saleTotal / sumLineTotals);
 }
 
+/**
+ * Net revenue actually attributable to one sale line — the same proportional
+ * spread as {@link netUnitPaid} (bill-level discount + tax spread across
+ * lines so Σ(netLineRevenue) over a sale equals its `saleTotal`), but for
+ * callers aggregating whole-line revenue (reports/dashboards) rather than a
+ * per-unit refund amount. A line's stored `lineTotal` is net of only its OWN
+ * line discount; profit/margin computed from that alone ignores any
+ * bill-level discount and overstates revenue (and therefore profit/margin).
+ */
+export function netLineRevenue(lineTotal: number, sumLineTotals: number, saleTotal: number): number {
+  if (sumLineTotals <= 0 || saleTotal <= 0) return 0;
+  return lineTotal * (saleTotal / sumLineTotals);
+}
+
 export interface UdhaarRefundSplit {
   /** Portion of the refund that must come off the customer's khata. */
   udhaarPortion: number;

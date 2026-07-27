@@ -5,8 +5,8 @@ import { getVariantOptions, getVariantNames } from "@/lib/catalog";
 import { fetchAll, selectAll, fetchAllByIds } from "@/lib/fetch-all";
 import { expandCategorySelection } from "@/lib/categories";
 import { formatPKR, formatNumber } from "@hamza/shared/utils";
-import { bucketKey, bucketOf, type DateRange } from "@hamza/shared/dates";
-import { format } from "date-fns";
+import { bucketKey, bucketOf, formatKarachiDateTime, type DateRange } from "@hamza/shared/dates";
+import { netLineRevenue } from "@hamza/shared/pricing";
 
 type Supabase = Awaited<ReturnType<typeof createClient>>;
 
@@ -63,20 +63,27 @@ function trend(range: DateRange, rows: { created_at: string; value: number }[], 
 
 export async function buildReport(supabase: Supabase, key: string, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   switch (key) {
-    case "profit": return profitReport(supabase, range);
+    case "profit": return profitReport(supabase, range, params);
     case "inventory": return inventoryReport(supabase, range, params);
     case "stockin": return stockInReport(supabase, range, params);
     case "products": return productsReport(supabase, range, params);
     case "purchases": return purchasesReport(supabase, range);
     case "customers": return customersReport(supabase, range);
     case "users": return usersReport(supabase, range);
-    case "system": return systemReport(supabase, range);
+    case "system": return systemReport(supabase, range, params);
     case "sales":
     default: return salesReport(supabase, range, params);
   }
 }
 
 /* ---------------- shared fetch ---------------- */
+/** "net" (default) nets out bill-level discounts and returns — the actual money
+ * collected. "gross" is list-price revenue: no discount and no return netting. */
+export type ReportMode = "net" | "gross";
+export function parseMode(params: URLSearchParams): ReportMode {
+  return params.get("mode") === "gross" ? "gross" : "net";
+}
+
 // Both queries are paginated (fetchAll) so no range is silently capped at
 // PostgREST's 1000-row default. sale_items is filtered directly on the parent
 // sale's date via the FK embed (`sales!inner`) rather than an `.in("sale_id",
@@ -85,11 +92,11 @@ export async function buildReport(supabase: Supabase, key: string, range: DateRa
 // which is why wide custom ranges previously showed no data at all.
 async function fetchSales(supabase: Supabase, range: DateRange) {
   const sales = await fetchAll<{
-    id: string; total: number; discount: number; tax: number; cogs_total: number;
+    id: string; total: number; subtotal: number; discount: number; tax: number; cogs_total: number;
     profit: number; created_at: string; cashier_id: string | null; customer_id: string | null;
   }>((from, to) => supabase
     .from("sales")
-    .select("id, total, discount, tax, cogs_total, profit, created_at, cashier_id, customer_id")
+    .select("id, total, subtotal, discount, tax, cogs_total, profit, created_at, cashier_id, customer_id")
     .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
     .order("id").range(from, to));
 
@@ -99,7 +106,45 @@ async function fetchSales(supabase: Supabase, range: DateRange) {
     .gte("sales.created_at", iso(range.from)).lte("sales.created_at", iso(range.to))
     .order("id").range(from, to));
 
+  // `line_total` is net of only the LINE's own discount — it's stored before the
+  // bill-level/promo discount is applied. Spread that bill-level discount (and
+  // tax) back across the sale's lines proportionally, same basis as the
+  // returns/refund path (netUnitPaid), so every per-product/category/variant
+  // revenue and profit figure reconciles to the (already-correct) sale-header
+  // `total`/`profit` instead of overstating on the pre-discount line amount.
+  // `gross_line_total` is the undiscounted list-price amount (qty × unit_price)
+  // for the Gross view — no discount spread needed since nothing is subtracted.
+  const saleTotalOf = new Map(sales.map((s) => [s.id, Number(s.total)]));
+  const sumLineTotalsOf = new Map<string, number>();
+  for (const it of items) {
+    const sid = it.sale_id as string;
+    sumLineTotalsOf.set(sid, (sumLineTotalsOf.get(sid) ?? 0) + Number(it.line_total));
+  }
+  for (const it of items) {
+    const sid = it.sale_id as string;
+    it.net_line_total = netLineRevenue(Number(it.line_total), sumLineTotalsOf.get(sid) ?? 0, saleTotalOf.get(sid) ?? 0);
+    it.gross_line_total = Number(it.qty) * Number(it.unit_price);
+  }
+
   return { sales, items };
+}
+
+/** Revenue for one in-store sale under the given basis. */
+function saleRevenue(s: { total: number; subtotal: number }, mode: ReportMode): number {
+  return mode === "gross" ? Number(s.subtotal) : Number(s.total);
+}
+/** Profit for one in-store sale under the given basis — mirrors the stored
+ * `profit` column's shape (revenue − tax − cogs) so Net/Gross only differ by
+ * which revenue basis feeds in, never by a different formula. */
+function saleProfit(s: { subtotal: number; tax: number; cogs_total: number; profit: number }, mode: ReportMode): number {
+  return mode === "gross" ? Number(s.subtotal) - Number(s.tax) - Number(s.cogs_total) : Number(s.profit);
+}
+/** Revenue/profit for one line item under the given basis. */
+function lineRevenue(it: Record<string, unknown>, mode: ReportMode): number {
+  return mode === "gross" ? Number(it.gross_line_total) : Number(it.net_line_total);
+}
+function lineProfit(it: Record<string, unknown>, mode: ReportMode): number {
+  return lineRevenue(it, mode) - Number(it.qty) * Number(it.unit_cogs);
 }
 
 /**
@@ -177,11 +222,11 @@ async function fetchReturns(supabase: Supabase, range: DateRange): Promise<Retur
  * COGS comes from the ledger moves posted when the order shipped, so profit lines
  * up with the inventory cost. Recognised by order created_at (placement).
  */
-interface WebTxn { id: string; total: number; profit: number; cogs: number; created_at: string }
+interface WebTxn { id: string; total: number; subtotal: number; profit: number; grossProfit: number; cogs: number; created_at: string }
 async function fetchWebOrders(supabase: Supabase, range: DateRange): Promise<WebTxn[]> {
-  const orders = await fetchAll<{ id: string; total: number; created_at: string }>((from, to) => supabase
+  const orders = await fetchAll<{ id: string; total: number; subtotal: number; created_at: string }>((from, to) => supabase
     .from("orders")
-    .select("id, total, created_at")
+    .select("id, total, subtotal, created_at")
     .in("status", ["SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED"])
     .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
     .order("id").range(from, to));
@@ -203,13 +248,21 @@ async function fetchWebOrders(supabase: Supabase, range: DateRange): Promise<Web
   for (const m of moves) cogs.set(m.reference_id, (cogs.get(m.reference_id) ?? 0) + Number(m.qty) * Number(m.unit_cost ?? 0));
   return orders.map((o) => {
     const c = cogs.get(o.id) ?? 0;
-    return { id: o.id, total: Number(o.total), cogs: c, profit: Number(o.total) - c, created_at: o.created_at };
+    return { id: o.id, total: Number(o.total), subtotal: Number(o.subtotal), cogs: c, profit: Number(o.total) - c, grossProfit: Number(o.subtotal) - c, created_at: o.created_at };
   });
+}
+/** Revenue for one fulfilled web order under the given basis. */
+function webRevenue(w: WebTxn, mode: ReportMode): number {
+  return mode === "gross" ? w.subtotal : w.total;
+}
+function webProfit(w: WebTxn, mode: ReportMode): number {
+  return mode === "gross" ? w.grossProfit : w.profit;
 }
 
 /* ---------------- 1. Sales ---------------- */
 async function salesReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   const groupBy = params.get("view") ?? "day";
+  const mode = parseMode(params);
   const { sales, items } = await fetchSales(supabase, range);
   const web = await fetchWebOrders(supabase, range);
   const returns = await fetchReturns(supabase, range);
@@ -217,16 +270,19 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
   const catName = await categoryNames(supabase);
 
-  // headline numbers span both channels (in-store POS + fulfilled web orders),
-  // NET of counter returns (a return is not a sale).
-  const totalSales = sales.reduce((s, x) => s + Number(x.total), 0) + web.reduce((s, x) => s + x.total, 0) - returns.totalRevenue;
-  const totalProfit = sales.reduce((s, x) => s + Number(x.profit), 0) + web.reduce((s, x) => s + x.profit, 0) - returns.totalProfit;
+  // headline numbers span both channels (in-store POS + fulfilled web orders).
+  // Net nets out counter returns (a return is not a sale) and bill-level
+  // discount; Gross is list-price revenue with neither subtracted.
+  const retRevenue = mode === "net" ? returns.totalRevenue : 0;
+  const retProfit = mode === "net" ? returns.totalProfit : 0;
+  const totalSales = sales.reduce((s, x) => s + saleRevenue(x, mode), 0) + web.reduce((s, x) => s + webRevenue(x, mode), 0) - retRevenue;
+  const totalProfit = sales.reduce((s, x) => s + saleProfit(x, mode), 0) + web.reduce((s, x) => s + webProfit(x, mode), 0) - retProfit;
   const count = sales.length + web.length;
 
   const chart = trend(range, [
-    ...sales.map((s) => ({ created_at: s.created_at, value: Number(s.total) })),
-    ...web.map((w) => ({ created_at: w.created_at, value: w.total })),
-    ...returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.revenue })),
+    ...sales.map((s) => ({ created_at: s.created_at, value: saleRevenue(s, mode) })),
+    ...web.map((w) => ({ created_at: w.created_at, value: webRevenue(w, mode) })),
+    ...(mode === "net" ? returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.revenue })) : []),
   ], "blue", "sales");
 
   let columns: ReportColumn[]; let rows: Record<string, unknown>[];
@@ -237,12 +293,12 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
       const k = groupBy === "category" ? (v?.category_id ?? "—") : (it.variant_id as string);
       const name = groupBy === "category" ? (v?.category_id ? (catName.get(v.category_id) ?? "—") : "Uncategorised") : (v ? `${v.product_name} · ${v.label}` : "—");
       const cur = agg.get(k) ?? { name, qty: 0, revenue: 0, profit: 0 };
-      cur.qty += Number(it.qty); cur.revenue += Number(it.line_total);
-      cur.profit += Number(it.line_total) - Number(it.qty) * Number(it.unit_cogs);
+      cur.qty += Number(it.qty); cur.revenue += lineRevenue(it, mode);
+      cur.profit += lineProfit(it, mode);
       agg.set(k, cur);
     }
-    // Net out returns per product/category.
-    for (const [vid, rv] of returns.byVariant) {
+    // Net out returns per product/category (Net mode only).
+    if (mode === "net") for (const [vid, rv] of returns.byVariant) {
       const v = vMap.get(vid);
       const k = groupBy === "category" ? (v?.category_id ?? "—") : vid;
       const cur = agg.get(k);
@@ -261,7 +317,7 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
     for (const s of sales) {
       const k = s.cashier_id ?? "—";
       const cur = agg.get(k) ?? { name: s.cashier_id ? (names.get(s.cashier_id) ?? "—") : "—", orders: 0, sales: 0, profit: 0 };
-      cur.orders += 1; cur.sales += Number(s.total); cur.profit += Number(s.profit);
+      cur.orders += 1; cur.sales += saleRevenue(s, mode); cur.profit += saleProfit(s, mode);
       agg.set(k, cur);
     }
     columns = [
@@ -270,6 +326,8 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
     ];
     rows = [...agg.values()].sort((a, b) => b.sales - a.sales);
   } else if (groupBy === "payment") {
+    // Actual money collected — always the same figure regardless of Net/Gross
+    // (there's no "list price" version of a payment already taken).
     // Filtered directly on the parent sale's date via the FK embed rather than an
     // `.in("sale_id", ids)` list — same URL/header-limit issue as fetchSales above.
     const pays = await fetchAll<{ method: string; amount: number }>((from, to) => supabase
@@ -282,8 +340,8 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
     columns = [{ key: "name", header: "Payment type", kind: "text" }, { key: "amount", header: "Amount", align: "right", kind: "pkr" }];
     rows = [...agg.entries()].map(([name, amount]) => ({ name, amount })).sort((a, b) => b.amount - a.amount);
   } else if (groupBy === "channel") {
-    const pos = { name: "In-store (POS)", orders: sales.length, sales: sales.reduce((s, x) => s + Number(x.total), 0) - returns.totalRevenue, profit: sales.reduce((s, x) => s + Number(x.profit), 0) - returns.totalProfit };
-    const online = { name: "Online (Web)", orders: web.length, sales: web.reduce((s, x) => s + x.total, 0), profit: web.reduce((s, x) => s + x.profit, 0) };
+    const pos = { name: "In-store (POS)", orders: sales.length, sales: sales.reduce((s, x) => s + saleRevenue(x, mode), 0) - retRevenue, profit: sales.reduce((s, x) => s + saleProfit(x, mode), 0) - retProfit };
+    const online = { name: "Online (Web)", orders: web.length, sales: web.reduce((s, x) => s + webRevenue(x, mode), 0), profit: web.reduce((s, x) => s + webProfit(x, mode), 0) };
     columns = [
       { key: "name", header: "Channel", kind: "text" }, { key: "orders", header: "Orders", align: "right", kind: "num" },
       { key: "sales", header: "Sales", align: "right", kind: "pkr" }, { key: "profit", header: "Profit", align: "right", kind: "pkr" },
@@ -295,17 +353,17 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
     for (const s of sales) {
       const k = bucketKey(new Date(s.created_at), b);
       const cur = agg.get(k) ?? { label: k, orders: 0, sales: 0, profit: 0 };
-      cur.orders += 1; cur.sales += Number(s.total); cur.profit += Number(s.profit);
+      cur.orders += 1; cur.sales += saleRevenue(s, mode); cur.profit += saleProfit(s, mode);
       agg.set(k, cur);
     }
     for (const w of web) {
       const k = bucketKey(new Date(w.created_at), b);
       const cur = agg.get(k) ?? { label: k, orders: 0, sales: 0, profit: 0 };
-      cur.orders += 1; cur.sales += w.total; cur.profit += w.profit;
+      cur.orders += 1; cur.sales += webRevenue(w, mode); cur.profit += webProfit(w, mode);
       agg.set(k, cur);
     }
-    // Net out returns per period (no order count — a return isn't a new order).
-    for (const r of returns.byDate) {
+    // Net out returns per period (Net mode only; no order count — a return isn't a new order).
+    if (mode === "net") for (const r of returns.byDate) {
       const k = bucketKey(new Date(r.created_at), b);
       const cur = agg.get(k) ?? { label: k, orders: 0, sales: 0, profit: 0 };
       cur.sales -= r.revenue; cur.profit -= r.profit;
@@ -319,9 +377,9 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
   }
 
   return {
-    key: "sales", title: "Sales Report", subtitle: range.label,
+    key: "sales", title: "Sales Report", subtitle: `${range.label} · ${mode === "gross" ? "Gross" : "Net"}`,
     kpis: [
-      { label: "Total Sales", value: formatPKR(totalSales, { compact: true }), fullValue: formatPKR(totalSales), accent: "blue", sensitive: true },
+      { label: mode === "gross" ? "Total Sales (Gross)" : "Total Sales", value: formatPKR(totalSales, { compact: true }), fullValue: formatPKR(totalSales), accent: "blue", sensitive: true },
       { label: "Profit", value: formatPKR(totalProfit, { compact: true }), fullValue: formatPKR(totalProfit), accent: "green", sensitive: true },
       { label: "Transactions", value: formatNumber(count), accent: "purple" },
       { label: "Avg Basket", value: formatPKR(count ? totalSales / count : 0), accent: "teal", sensitive: true },
@@ -337,15 +395,20 @@ async function salesReport(supabase: Supabase, range: DateRange, params: URLSear
 }
 
 /* ---------------- 2. Profit & margin ---------------- */
-async function profitReport(supabase: Supabase, range: DateRange): Promise<ReportData> {
+async function profitReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
+  const mode = parseMode(params);
   const { sales, items } = await fetchSales(supabase, range);
   const web = await fetchWebOrders(supabase, range);
   const returns = await fetchReturns(supabase, range);
   const variants = await getVariantOptions(supabase);
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
-  // Net of returns: refunds reduce revenue, and the returned COGS goes back to stock.
-  const revenue = sales.reduce((s, x) => s + Number(x.total), 0) + web.reduce((s, x) => s + x.total, 0) - returns.totalRevenue;
-  const cogs = sales.reduce((s, x) => s + Number(x.cogs_total), 0) + web.reduce((s, x) => s + x.cogs, 0) - returns.totalCogs;
+  // Net (default): refunds reduce revenue and COGS returns to stock, and revenue
+  // is what was actually paid after the bill-level discount. Gross: list-price
+  // revenue, COGS and revenue both left un-netted against returns.
+  const retRevenue = mode === "net" ? returns.totalRevenue : 0;
+  const retCogs = mode === "net" ? returns.totalCogs : 0;
+  const revenue = sales.reduce((s, x) => s + saleRevenue(x, mode), 0) + web.reduce((s, x) => s + webRevenue(x, mode), 0) - retRevenue;
+  const cogs = sales.reduce((s, x) => s + Number(x.cogs_total), 0) + web.reduce((s, x) => s + x.cogs, 0) - retCogs;
   const profit = revenue - cogs;
   const margin = revenue ? (profit / revenue) * 100 : 0;
 
@@ -353,29 +416,29 @@ async function profitReport(supabase: Supabase, range: DateRange): Promise<Repor
   for (const it of items) {
     const v = vMap.get(it.variant_id as string);
     const k = it.variant_id as string;
-    const rev = Number(it.line_total); const c = Number(it.qty) * Number(it.unit_cogs);
+    const rev = lineRevenue(it, mode); const c = Number(it.qty) * Number(it.unit_cogs);
     const cur = agg.get(k) ?? { name: v ? `${v.product_name} · ${v.label}` : "—", revenue: 0, cogs: 0, profit: 0, margin: 0 };
     cur.revenue += rev; cur.cogs += c; cur.profit += rev - c;
     agg.set(k, cur);
   }
-  for (const [vid, rv] of returns.byVariant) {
+  if (mode === "net") for (const [vid, rv] of returns.byVariant) {
     const cur = agg.get(vid);
     if (cur) { cur.revenue -= rv.revenue; cur.cogs -= rv.cogs; cur.profit -= rv.profit; }
   }
   const rows = [...agg.values()].map((r) => ({ ...r, margin: r.revenue ? (r.profit / r.revenue) * 100 : 0 })).sort((a, b) => b.profit - a.profit);
 
   return {
-    key: "profit", title: "Profit & Margin", subtitle: range.label,
+    key: "profit", title: "Profit & Margin", subtitle: `${range.label} · ${mode === "gross" ? "Gross" : "Net"}`,
     kpis: [
-      { label: "Revenue", value: formatPKR(revenue, { compact: true }), fullValue: formatPKR(revenue), accent: "blue", sensitive: true },
+      { label: mode === "gross" ? "Revenue (Gross)" : "Revenue", value: formatPKR(revenue, { compact: true }), fullValue: formatPKR(revenue), accent: "blue", sensitive: true },
       { label: "COGS", value: formatPKR(cogs, { compact: true }), fullValue: formatPKR(cogs), accent: "amber", sensitive: true },
       { label: "Gross Profit", value: formatPKR(profit, { compact: true }), fullValue: formatPKR(profit), accent: "green", sensitive: true },
       { label: "Margin", value: `${margin.toFixed(1)}%`, accent: "teal", sensitive: true },
     ],
     charts: [{ ...trend(range, [
-      ...sales.map((s) => ({ created_at: s.created_at, value: Number(s.profit) })),
-      ...web.map((w) => ({ created_at: w.created_at, value: w.profit })),
-      ...returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.profit })),
+      ...sales.map((s) => ({ created_at: s.created_at, value: saleProfit(s, mode) })),
+      ...web.map((w) => ({ created_at: w.created_at, value: webProfit(w, mode) })),
+      ...(mode === "net" ? returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.profit })) : []),
     ], "green", "profit"), title: "Profit trend" }],
     columns: [
       { key: "name", header: "Product", kind: "text" }, { key: "revenue", header: "Revenue", align: "right", kind: "pkr" },
@@ -470,22 +533,34 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
   const { data: locs } = await supabase.from("locations").select("id, type");
   const supplierLocIds = (locs ?? []).filter((l) => l.type === "SUPPLIER").map((l) => l.id);
 
-  let mq = supabase
-    .from("stock_moves")
-    .select("id, variant_id, product_id, qty, unit_cost, created_at, created_by, reference_type, reference_id")
-    .in("from_location_id", supplierLocIds)
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
-    .order("created_at", { ascending: false });
-  if (fProduct) mq = mq.eq("product_id", fProduct);
-  if (fUser) mq = mq.eq("created_by", fUser);
-  const { data: moves } = await mq;
+  // Paginated (not a plain .select()) — an unpaginated stock-moves read is
+  // silently capped at 1000 rows by PostgREST, which would drop older stock
+  // additions from a wide-range report on a store this size.
+  const moves = await fetchAll<{
+    id: string; variant_id: string; product_id: string; qty: number; unit_cost: number | null;
+    created_at: string; created_by: string | null; reference_type: string; reference_id: string | null;
+  }>((from, to) => {
+    let q = supabase
+      .from("stock_moves")
+      .select("id, variant_id, product_id, qty, unit_cost, created_at, created_by, reference_type, reference_id")
+      .in("from_location_id", supplierLocIds)
+      .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+      .order("created_at", { ascending: false }).order("id").range(from, to);
+    if (fProduct) q = q.eq("product_id", fProduct);
+    if (fUser) q = q.eq("created_by", fUser);
+    return q;
+  });
 
-  // supplier comes from the goods receipt the move references (when any)
-  const grnIds = [...new Set((moves ?? []).map((m) => m.reference_id).filter(Boolean))] as string[];
-  const { data: grns } = grnIds.length
-    ? await supabase.from("goods_receipts").select("id, supplier_id").in("id", grnIds)
-    : { data: [] as { id: string; supplier_id: string | null }[] };
-  const grnSupplier = new Map((grns ?? []).map((g) => [g.id, g.supplier_id]));
+  // supplier comes from the goods receipt the move references (when any).
+  // Chunked + paginated (fetchAllByIds) rather than a single `.in()` — once
+  // `moves` above is fully paginated, a wide range can reference hundreds of
+  // distinct GRNs, which would blow past PostgREST's URL/header limit.
+  const grnIds = [...new Set(moves.map((m) => m.reference_id).filter(Boolean))] as string[];
+  const grns = grnIds.length
+    ? await fetchAllByIds<{ id: string; supplier_id: string | null }>(grnIds, (chunk, from, to) => supabase
+        .from("goods_receipts").select("id, supplier_id").in("id", chunk).order("id").range(from, to))
+    : [];
+  const grnSupplier = new Map(grns.map((g) => [g.id, g.supplier_id]));
   const { data: suppliers } = await supabase.from("suppliers").select("id, name");
   const supName = new Map((suppliers ?? []).map((s) => [s.id, s.name as string]));
 
@@ -497,7 +572,7 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
   const profiles = await profileNames(supabase);
 
   type Add = Record<string, unknown> & { _cat: string | null; _sup: string; created_at: string; qty: number; value: number; product: string };
-  let rows: Add[] = (moves ?? []).map((m) => {
+  let rows: Add[] = moves.map((m) => {
     const nm = nameMap.get(m.variant_id);
     const supplierId = m.reference_id ? (grnSupplier.get(m.reference_id) ?? null) : null;
     const supplier = supplierId ? (supName.get(supplierId) ?? "—") : (m.reference_type === "OPENING" ? "Opening stock" : "—");
@@ -507,7 +582,7 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
       _cat: nm?.category_id ?? null,
       _sup: supplierId ?? "",
       created_at: m.created_at,
-      datetime: format(new Date(m.created_at), "d MMM yyyy, h:mm a"),
+      datetime: formatKarachiDateTime(new Date(m.created_at)),
       product: nm ? `${nm.product_name} · ${nm.label}` : "—",
       qty, cost, value: qty * cost, supplier,
       user: m.created_by ? (profiles.get(m.created_by) ?? "—") : "—",
@@ -559,27 +634,29 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
 /* ---------------- 4. Product performance ---------------- */
 async function productsReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   const view = params.get("view") ?? "best";
+  const mode = parseMode(params);
   const { items } = await fetchSales(supabase, range);
   const returns = await fetchReturns(supabase, range);
   const variants = await getVariantOptions(supabase);
   const { data: avail } = await selectAll<{ variant_id: string; on_hand: number }>((from, to) => supabase.from("variant_availability").select("variant_id, on_hand").order("variant_id").range(from, to));
   const availMap = new Map((avail ?? []).map((a) => [a.variant_id, Number(a.on_hand)]));
 
-  // Gross units/revenue/profit per variant — used ONLY for the unchanged Dead-stock
-  // classification ("did this variant ever sell at all?").
-  const gross = new Map<string, { qty: number; revenue: number; profit: number }>();
+  // Units/revenue/profit ever sold per variant, on the Net/Gross basis per `mode`.
+  // The qty here (unaffected by mode) is used for the Dead-stock classification
+  // ("did this variant ever sell at all?").
+  const everSold = new Map<string, { qty: number; revenue: number; profit: number }>();
   for (const it of items) {
     const k = it.variant_id as string;
-    const cur = gross.get(k) ?? { qty: 0, revenue: 0, profit: 0 };
-    cur.qty += Number(it.qty); cur.revenue += Number(it.line_total);
-    cur.profit += Number(it.line_total) - Number(it.qty) * Number(it.unit_cogs);
-    gross.set(k, cur);
+    const cur = everSold.get(k) ?? { qty: 0, revenue: 0, profit: 0 };
+    cur.qty += Number(it.qty); cur.revenue += lineRevenue(it, mode);
+    cur.profit += lineProfit(it, mode);
+    everSold.set(k, cur);
   }
-  // Net of returns — every reported figure (units/revenue/profit/top-sellers) is
-  // net, so a fully returned item is not counted as a net sale.
+  // Net of returns (Net mode only) — every reported figure (units/revenue/profit/
+  // top-sellers) is net, so a fully returned item is not counted as a net sale.
   const sold = new Map<string, { qty: number; revenue: number; profit: number }>();
-  for (const [k, g] of gross) sold.set(k, { ...g });
-  for (const [vid, rv] of returns.byVariant) {
+  for (const [k, g] of everSold) sold.set(k, { ...g });
+  if (mode === "net") for (const [vid, rv] of returns.byVariant) {
     const cur = sold.get(vid) ?? { qty: 0, revenue: 0, profit: 0 };
     cur.qty -= rv.qty; cur.revenue -= rv.revenue; cur.profit -= rv.profit;
     sold.set(vid, cur);
@@ -587,10 +664,10 @@ async function productsReport(supabase: Supabase, range: DateRange, params: URLS
 
   let all = variants.map((v) => {
     const s = sold.get(v.variant_id) ?? { qty: 0, revenue: 0, profit: 0 };
-    return { name: `${v.product_name} · ${v.label}`, sku: v.sku, qty: s.qty, revenue: s.revenue, profit: s.profit, on_hand: availMap.get(v.variant_id) ?? 0, grossQty: gross.get(v.variant_id)?.qty ?? 0 };
+    return { name: `${v.product_name} · ${v.label}`, sku: v.sku, qty: s.qty, revenue: s.revenue, profit: s.profit, on_hand: availMap.get(v.variant_id) ?? 0, grossQty: everSold.get(v.variant_id)?.qty ?? 0 };
   });
 
-  // Dead = never sold (gross) and still on hand — unchanged by returns netting.
+  // Dead = never sold (any basis) and still on hand — unaffected by returns netting.
   if (view === "dead") all = all.filter((r) => r.grossQty === 0 && r.on_hand > 0).sort((a, b) => b.on_hand - a.on_hand);
   else if (view === "slow") all = all.filter((r) => r.on_hand > 0).sort((a, b) => a.qty - b.qty);
   else all = all.filter((r) => r.qty > 0).sort((a, b) => b.revenue - a.revenue);
@@ -598,12 +675,12 @@ async function productsReport(supabase: Supabase, range: DateRange, params: URLS
   const bestForChart = [...all].filter((r) => r.revenue > 0).slice(0, 10).map((r) => ({ label: r.name.split(" · ")[0].slice(0, 14), revenue: Math.round(r.revenue) }));
 
   return {
-    key: "products", title: "Product Performance", subtitle: range.label,
+    key: "products", title: "Product Performance", subtitle: `${range.label} · ${mode === "gross" ? "Gross" : "Net"}`,
     kpis: [
       { label: "Variants sold", value: formatNumber([...sold.values()].filter((s) => s.qty > 0).length), accent: "blue" },
-      { label: "Dead stock", value: formatNumber(variants.filter((v) => !(gross.get(v.variant_id)?.qty) && (availMap.get(v.variant_id) ?? 0) > 0).length), accent: "coral" },
+      { label: "Dead stock", value: formatNumber(variants.filter((v) => !(everSold.get(v.variant_id)?.qty) && (availMap.get(v.variant_id) ?? 0) > 0).length), accent: "coral" },
       { label: "Units sold", value: formatNumber([...sold.values()].reduce((s, x) => s + x.qty, 0)), accent: "teal" },
-      { label: "Revenue", value: formatPKR([...sold.values()].reduce((s, x) => s + x.revenue, 0), { compact: true }), fullValue: formatPKR([...sold.values()].reduce((s, x) => s + x.revenue, 0)), accent: "green", sensitive: true },
+      { label: mode === "gross" ? "Revenue (Gross)" : "Revenue", value: formatPKR([...sold.values()].reduce((s, x) => s + x.revenue, 0), { compact: true }), fullValue: formatPKR([...sold.values()].reduce((s, x) => s + x.revenue, 0)), accent: "green", sensitive: true },
     ],
     charts: [{ type: "bar", title: "Top sellers by revenue", data: bestForChart, dataKey: "revenue", accent: "blue" }],
     columns: [
@@ -620,15 +697,16 @@ async function productsReport(supabase: Supabase, range: DateRange, params: URLS
 
 /* ---------------- 5. Purchases & suppliers ---------------- */
 async function purchasesReport(supabase: Supabase, range: DateRange): Promise<ReportData> {
-  const { data: receipts } = await supabase
+  const receipts = await fetchAll<{ supplier_id: string | null; total: number; created_at: string }>((from, to) => supabase
     .from("goods_receipts").select("supplier_id, total, created_at")
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to));
+    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+    .order("id").range(from, to));
   const { data: suppliers } = await supabase.from("suppliers").select("id, name, balance");
   const supName = new Map((suppliers ?? []).map((s) => [s.id, s.name]));
 
   const spendBy = new Map<string, number>();
   let totalSpend = 0;
-  for (const r of receipts ?? []) {
+  for (const r of receipts) {
     totalSpend += Number(r.total);
     const k = r.supplier_id ?? "—";
     spendBy.set(k, (spendBy.get(k) ?? 0) + Number(r.total));
@@ -643,7 +721,7 @@ async function purchasesReport(supabase: Supabase, range: DateRange): Promise<Re
     key: "purchases", title: "Purchases & Suppliers", subtitle: range.label,
     kpis: [
       { label: "Spend (period)", value: formatPKR(totalSpend, { compact: true }), fullValue: formatPKR(totalSpend), accent: "blue", sensitive: true },
-      { label: "Receipts", value: formatNumber((receipts ?? []).length), accent: "purple" },
+      { label: "Receipts", value: formatNumber(receipts.length), accent: "purple" },
       { label: "Total Payable", value: formatPKR(totalPayable, { compact: true }), fullValue: formatPKR(totalPayable), accent: "coral", sensitive: true },
       { label: "Suppliers", value: formatNumber((suppliers ?? []).length), accent: "teal" },
     ],
@@ -661,8 +739,13 @@ async function purchasesReport(supabase: Supabase, range: DateRange): Promise<Re
 async function customersReport(supabase: Supabase, range: DateRange): Promise<ReportData> {
   const { sales } = await fetchSales(supabase, range);
   const returns = await fetchReturns(supabase, range);
-  const { data: customers } = await supabase.from("customers").select("id, name, credit_balance");
-  const { data: ledger } = await supabase.from("customer_ledger").select("customer_id, type, created_at").eq("type", "CHARGE");
+  // Paginated: an established store's customer/charge-ledger tables can exceed
+  // PostgREST's 1000-row default cap, which would silently understate the
+  // "Outstanding Udhaar" total and drop customers from the aging breakdown.
+  const customers = await fetchAll<{ id: string; name: string; credit_balance: number }>((from, to) => supabase
+    .from("customers").select("id, name, credit_balance").order("id").range(from, to));
+  const ledger = await fetchAll<{ customer_id: string; created_at: string }>((from, to) => supabase
+    .from("customer_ledger").select("customer_id, created_at").eq("type", "CHARGE").order("id").range(from, to));
 
   const salesBy = new Map<string, { amount: number; orders: number }>();
   for (const s of sales) {
@@ -675,7 +758,7 @@ async function customersReport(supabase: Supabase, range: DateRange): Promise<Re
   const netSalesOf = (cid: string) => (salesBy.get(cid)?.amount ?? 0) - (returns.byCustomer.get(cid)?.revenue ?? 0);
   // oldest charge per customer (rough aging)
   const oldestCharge = new Map<string, number>();
-  for (const l of ledger ?? []) {
+  for (const l of ledger) {
     const t = new Date(l.created_at).getTime();
     oldestCharge.set(l.customer_id, Math.min(oldestCharge.get(l.customer_id) ?? t, t));
   }
@@ -685,8 +768,8 @@ async function customersReport(supabase: Supabase, range: DateRange): Promise<Re
     return days <= 30 ? "0–30d" : days <= 60 ? "31–60d" : days <= 90 ? "61–90d" : "90d+";
   };
 
-  const totalOutstanding = (customers ?? []).reduce((s, c) => s + Math.max(Number(c.credit_balance), 0), 0);
-  const rows = (customers ?? []).map((c) => ({
+  const totalOutstanding = customers.reduce((s, c) => s + Math.max(Number(c.credit_balance), 0), 0);
+  const rows = customers.map((c) => ({
     name: c.name, sales: netSalesOf(c.id), orders: salesBy.get(c.id)?.orders ?? 0,
     outstanding: Number(c.credit_balance), aging: ageBucket(c.id, Number(c.credit_balance)),
   })).sort((a, b) => b.outstanding - a.outstanding || b.sales - a.sales);
@@ -695,9 +778,9 @@ async function customersReport(supabase: Supabase, range: DateRange): Promise<Re
     key: "customers", title: "Customers & Udhaar", subtitle: range.label,
     kpis: [
       { label: "Outstanding Udhaar", value: formatPKR(totalOutstanding, { compact: true }), fullValue: formatPKR(totalOutstanding), accent: "coral", sensitive: true },
-      { label: "On Khata", value: formatNumber((customers ?? []).filter((c) => Number(c.credit_balance) > 0).length), accent: "amber" },
+      { label: "On Khata", value: formatNumber(customers.filter((c) => Number(c.credit_balance) > 0).length), accent: "amber" },
       { label: "Sales (period)", value: formatPKR(sales.reduce((s, x) => s + Number(x.total), 0) - returns.totalRevenue, { compact: true }), fullValue: formatPKR(sales.reduce((s, x) => s + Number(x.total), 0) - returns.totalRevenue), accent: "blue", sensitive: true },
-      { label: "Customers", value: formatNumber((customers ?? []).length), accent: "teal" },
+      { label: "Customers", value: formatNumber(customers.length), accent: "teal" },
     ],
     charts: [{ type: "bar", title: "Top customers by sales", accent: "teal", dataKey: "sales",
       data: rows.filter((r) => r.sales > 0).sort((a, b) => b.sales - a.sales).slice(0, 10).map((r) => ({ label: r.name.slice(0, 14), sales: Math.round(r.sales) })) }],
@@ -714,9 +797,13 @@ async function usersReport(supabase: Supabase, range: DateRange): Promise<Report
   const { sales } = await fetchSales(supabase, range);
   const returns = await fetchReturns(supabase, range);
   const { data: profiles } = await supabase.from("profiles").select("id, full_name, role");
-  const { data: audit } = await supabase
+  // Paginated: a busy store logs every action, so audit_log over a wide range
+  // (e.g. "This Year") can exceed PostgREST's 1000-row cap and silently
+  // undercount Logged Actions / Adjustments.
+  const audit = await fetchAll<{ actor: string | null; action: string; created_at: string }>((from, to) => supabase
     .from("audit_log").select("actor, action, created_at")
-    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to));
+    .gte("created_at", iso(range.from)).lte("created_at", iso(range.to))
+    .order("id").range(from, to));
 
   const stat = new Map<string, { name: string; role: string; orders: number; sales: number; adjustments: number; actions: number }>();
   const ensure = (id: string) => {
@@ -730,7 +817,7 @@ async function usersReport(supabase: Supabase, range: DateRange): Promise<Report
   // Net refunds out of the cashier's sales money (orders stays a transaction tally).
   // Only adjust cashiers already active this period — never invent a new staff row.
   for (const [cashierId, rv] of returns.byCashier) { const r = stat.get(cashierId); if (r) r.sales -= rv.revenue; }
-  for (const a of audit ?? []) if (a.actor) {
+  for (const a of audit) if (a.actor) {
     const r = ensure(a.actor); r.actions += 1;
     if (a.action === "stock_adjustment" || a.action === "cycle_count") r.adjustments += 1;
   }
@@ -741,7 +828,7 @@ async function usersReport(supabase: Supabase, range: DateRange): Promise<Report
       { label: "Active Staff", value: formatNumber(stat.size), accent: "blue" },
       { label: "Orders Handled", value: formatNumber(sales.length), accent: "purple" },
       { label: "Adjustments", value: formatNumber([...stat.values()].reduce((s, x) => s + x.adjustments, 0)), accent: "amber" },
-      { label: "Logged Actions", value: formatNumber((audit ?? []).length), accent: "teal" },
+      { label: "Logged Actions", value: formatNumber(audit.length), accent: "teal" },
     ],
     charts: [{ type: "bar", title: "Sales by cashier", accent: "blue", dataKey: "sales",
       data: [...stat.values()].filter((r) => r.sales > 0).sort((a, b) => b.sales - a.sales).map((r) => ({ label: r.name.slice(0, 12), sales: Math.round(r.sales) })) }],
@@ -755,23 +842,29 @@ async function usersReport(supabase: Supabase, range: DateRange): Promise<Report
 }
 
 /* ---------------- 8. Full system ---------------- */
-async function systemReport(supabase: Supabase, range: DateRange): Promise<ReportData> {
+async function systemReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
+  const mode = parseMode(params);
   const { sales, items } = await fetchSales(supabase, range);
   const variants = await getVariantOptions(supabase);
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
   const catName = await categoryNames(supabase);
   const [{ data: avail }, { data: suppliers }, { data: customers }, { count: orderCount }] = await Promise.all([
     selectAll<{ variant_id: string; on_hand: number }>((from, to) => supabase.from("variant_availability").select("variant_id, on_hand").order("variant_id").range(from, to)),
-    supabase.from("suppliers").select("balance"),
-    supabase.from("customers").select("credit_balance"),
+    // Paginated: an unbounded select silently caps at 1000 rows and would
+    // understate Payables/Udhaar on the Full System headline for a store this size.
+    selectAll<{ balance: number }>((from, to) => supabase.from("suppliers").select("balance").order("id").range(from, to)),
+    selectAll<{ credit_balance: number }>((from, to) => supabase.from("customers").select("credit_balance").order("id").range(from, to)),
     supabase.from("orders").select("id", { count: "exact", head: true }).gte("created_at", iso(range.from)).lte("created_at", iso(range.to)),
   ]);
 
   const web = await fetchWebOrders(supabase, range);
   const returns = await fetchReturns(supabase, range);
-  // Net of counter returns so the headline + every breakdown agrees with the Sales tab.
-  const revenue = sales.reduce((s, x) => s + Number(x.total), 0) + web.reduce((s, x) => s + x.total, 0) - returns.totalRevenue;
-  const profit = sales.reduce((s, x) => s + Number(x.profit), 0) + web.reduce((s, x) => s + x.profit, 0) - returns.totalProfit;
+  // Net (default) of counter returns so the headline + every breakdown agrees
+  // with the Sales tab; Gross leaves discount and returns un-netted.
+  const retRevenue = mode === "net" ? returns.totalRevenue : 0;
+  const retProfit = mode === "net" ? returns.totalProfit : 0;
+  const revenue = sales.reduce((s, x) => s + saleRevenue(x, mode), 0) + web.reduce((s, x) => s + webRevenue(x, mode), 0) - retRevenue;
+  const profit = sales.reduce((s, x) => s + saleProfit(x, mode), 0) + web.reduce((s, x) => s + webProfit(x, mode), 0) - retProfit;
   // Active inventory only: vMap holds active variants (archived products are
   // excluded by getVariantOptions), so skip any variant absent from it — keeps
   // this figure consistent with the dashboard and Inventory Valuation report.
@@ -783,10 +876,10 @@ async function systemReport(supabase: Supabase, range: DateRange): Promise<Repor
   for (const it of items) {
     const v = vMap.get(it.variant_id as string);
     const cat = v?.category_id ? (catName.get(v.category_id) ?? "—") : "Uncategorised";
-    byCat.set(cat, (byCat.get(cat) ?? 0) + Number(it.line_total));
+    byCat.set(cat, (byCat.get(cat) ?? 0) + lineRevenue(it, mode));
   }
-  // Subtract returned revenue from its product's category (net category mix).
-  for (const [vid, rv] of returns.byVariant) {
+  // Subtract returned revenue from its product's category (Net mode only).
+  if (mode === "net") for (const [vid, rv] of returns.byVariant) {
     const v = vMap.get(vid);
     const cat = v?.category_id ? (catName.get(v.category_id) ?? "—") : "Uncategorised";
     byCat.set(cat, (byCat.get(cat) ?? 0) - rv.revenue);
@@ -797,17 +890,17 @@ async function systemReport(supabase: Supabase, range: DateRange): Promise<Repor
   for (const s of sales) {
     const k = bucketKey(new Date(s.created_at), b);
     const cur = dayAgg.get(k) ?? { label: k, sales: 0, profit: 0 };
-    cur.sales += Number(s.total); cur.profit += Number(s.profit);
+    cur.sales += saleRevenue(s, mode); cur.profit += saleProfit(s, mode);
     dayAgg.set(k, cur);
   }
   for (const w of web) {
     const k = bucketKey(new Date(w.created_at), b);
     const cur = dayAgg.get(k) ?? { label: k, sales: 0, profit: 0 };
-    cur.sales += w.total; cur.profit += w.profit;
+    cur.sales += webRevenue(w, mode); cur.profit += webProfit(w, mode);
     dayAgg.set(k, cur);
   }
-  // Net returns per period (a return isn't a new transaction, only money out).
-  for (const r of returns.byDate) {
+  // Net returns per period (Net mode only; a return isn't a new transaction, only money out).
+  if (mode === "net") for (const r of returns.byDate) {
     const k = bucketKey(new Date(r.created_at), b);
     const cur = dayAgg.get(k) ?? { label: k, sales: 0, profit: 0 };
     cur.sales -= r.revenue; cur.profit -= r.profit;
@@ -815,9 +908,9 @@ async function systemReport(supabase: Supabase, range: DateRange): Promise<Repor
   }
 
   return {
-    key: "system", title: "Full System Report", subtitle: range.label,
+    key: "system", title: "Full System Report", subtitle: `${range.label} · ${mode === "gross" ? "Gross" : "Net"}`,
     kpis: [
-      { label: "Sales", value: formatPKR(revenue, { compact: true }), fullValue: formatPKR(revenue), accent: "blue", sensitive: true },
+      { label: mode === "gross" ? "Sales (Gross)" : "Sales", value: formatPKR(revenue, { compact: true }), fullValue: formatPKR(revenue), accent: "blue", sensitive: true },
       { label: "Profit", value: formatPKR(profit, { compact: true }), fullValue: formatPKR(profit), accent: "green", sensitive: true },
       { label: "Online Orders", value: formatNumber(orderCount ?? 0), accent: "purple" },
       { label: "Stock Value", value: formatPKR(stockValue, { compact: true }), fullValue: formatPKR(stockValue), accent: "teal", sensitive: true },
@@ -826,9 +919,9 @@ async function systemReport(supabase: Supabase, range: DateRange): Promise<Repor
     ],
     charts: [
       { ...trend(range, [
-        ...sales.map((s) => ({ created_at: s.created_at, value: Number(s.total) })),
-        ...web.map((w) => ({ created_at: w.created_at, value: w.total })),
-        ...returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.revenue })),
+        ...sales.map((s) => ({ created_at: s.created_at, value: saleRevenue(s, mode) })),
+        ...web.map((w) => ({ created_at: w.created_at, value: webRevenue(w, mode) })),
+        ...(mode === "net" ? returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.revenue })) : []),
       ], "blue", "sales"), title: "Sales trend" },
       { type: "donut", title: "Sales by category", data: [...byCat.entries()].map(([name, value]) => ({ name, value: Math.round(value) })) },
     ],

@@ -10,11 +10,17 @@ import { DataTable, type Column } from "@hamza/shared/ui/DataTable";
 import { StatusPill } from "@hamza/shared/ui/StatusPill";
 import { EmptyState } from "@hamza/shared/ui/EmptyState";
 import { FilterBar } from "@hamza/shared/ui/FilterBar";
+import { Select } from "@hamza/shared/ui/Select";
 import { ExportMenu } from "@hamza/shared/ui/ExportMenu";
 import { AreaTrend, BarTrend, DonutChart } from "@/components/charts";
 import { CategoryMultiSelect } from "@/components/CategoryMultiSelect";
 import { formatPKR, formatNumber, cn } from "@hamza/shared/utils";
 import { REPORTS, type ReportData, type ReportColumn, type ReportChart } from "./queries";
+
+// Reports whose headline figures are Revenue/Profit/Margin-shaped enough for a
+// Net/Gross basis to make sense. Others (Purchases spend, Inventory valuation,
+// Customer/Staff activity) stay Net-only.
+const MODE_REPORTS = new Set(["sales", "profit", "products", "system"]);
 
 function fmt(kind: ReportColumn["kind"], v: unknown) {
   const n = Number(v);
@@ -31,10 +37,10 @@ export function ReportsClient({ reportKey, data }: { reportKey: string; data: Re
   const router = useRouter();
   const pathname = usePathname();
 
-  // tab links preserve the date range, reset per-report view
+  // tab links preserve the date range + Net/Gross basis, reset per-report view
   const tabHref = (key: string) => {
     const next = new URLSearchParams();
-    for (const k of ["preset", "from", "to"]) { const v = params.get(k); if (v) next.set(k, v); }
+    for (const k of ["preset", "from", "to", "mode"]) { const v = params.get(k); if (v) next.set(k, v); }
     next.set("report", key);
     return `/admin/reports?${next.toString()}`;
   };
@@ -43,6 +49,16 @@ export function ReportsClient({ reportKey, data }: { reportKey: string; data: Re
   const setCategoryIds = (ids: string[]) => {
     const next = new URLSearchParams(params.toString());
     if (ids.length) next.set("categories", ids.join(",")); else next.delete("categories");
+    router.push(`${pathname}?${next.toString()}`);
+  };
+
+  // Net (default) nets out bill-level discounts and returns — the actual money
+  // collected. Gross is list-price revenue with neither subtracted. Absent from
+  // the URL = Net, so a fresh session/refresh always loads Net.
+  const mode = params.get("mode") === "gross" ? "gross" : "net";
+  const setMode = (m: string) => {
+    const next = new URLSearchParams(params.toString());
+    if (m === "gross") next.set("mode", "gross"); else next.delete("mode");
     router.push(`${pathname}?${next.toString()}`);
   };
 
@@ -92,7 +108,18 @@ export function ReportsClient({ reportKey, data }: { reportKey: string; data: Re
         ))}
       </div>
 
-      <FilterBar dimensions={data.dimensions} className={data.categoryFilter ? "mb-3" : "mb-4"} />
+      <div className={cn("flex flex-col gap-3 sm:flex-row sm:items-start", data.categoryFilter ? "mb-3" : "mb-4")}>
+        <FilterBar dimensions={data.dimensions} className="flex-1" />
+        {MODE_REPORTS.has(reportKey) && (
+          <div className="flex items-center gap-2 rounded-xl border border-border bg-surface p-3">
+            <span className="text-sm text-text-tertiary">Basis</span>
+            <Select value={mode} onChange={(e) => setMode(e.target.value)} className="w-32">
+              <option value="net">Net</option>
+              <option value="gross">Gross</option>
+            </Select>
+          </div>
+        )}
+      </div>
 
       {data.categoryFilter && (
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface p-3">
