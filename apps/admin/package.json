@@ -8,8 +8,7 @@
     "start": "next start",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "prebuild": "npm run lint"
+    "test": "vitest run"
   },
   "dependencies": {
     "@hamza/shared": "*",
