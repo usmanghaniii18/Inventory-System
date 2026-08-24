@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Store, Loader2, ArrowLeft } from "lucide-react";
 import { Button } from "@hamza/shared/ui/Button";
 import { Input, Label, FieldError } from "@hamza/shared/ui/Input";
-import { startLogin, verifyOtp, resendOtp, requestPasswordReset } from "@/features/auth/actions";
+import { startLogin, verifyOtp, resendOtp } from "@/features/auth/actions";
 
 export default function LoginPage() {
   return (
@@ -39,6 +39,12 @@ function LoginForm() {
     const res = await startLogin(email, password);
     setLoading(false);
     if ("error" in res) return setError(res.error);
+    if ("ok" in res) {
+      // Cashier / manager — signed in with email + password, no OTP needed.
+      router.push(params.get("next") ?? "/admin/dashboard");
+      router.refresh();
+      return;
+    }
     setStep("otp"); setNotice(`We emailed a 6-digit code to ${email}.`); setCooldown(30);
   }
 
@@ -58,16 +64,6 @@ function LoginForm() {
     const res = await resendOtp();
     if ("error" in res) return setError(res.error);
     setNotice("A new code is on its way."); setCooldown(30);
-  }
-
-  async function onForgot() {
-    setError(undefined); setNotice(undefined);
-    if (!email) return setError("Enter your email first, then tap “Forgot password”.");
-    setLoading(true);
-    const res = await requestPasswordReset(email);
-    setLoading(false);
-    if ("error" in res) return setError(res.error);
-    setNotice("If that email is registered, a reset link is on its way.");
   }
 
   return (
@@ -94,11 +90,6 @@ function LoginForm() {
               <Label htmlFor="password">Password</Label>
               <Input id="password" type="password" autoComplete="current-password" value={password}
                 onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" required />
-            </div>
-            <div className="mt-2 text-right">
-              <button type="button" onClick={onForgot} className="text-xs font-medium text-brand-600 hover:underline">
-                Forgot password?
-              </button>
             </div>
             {error && <FieldError message={error} />}
             {notice && <p className="mt-1 text-xs text-green-text">{notice}</p>}

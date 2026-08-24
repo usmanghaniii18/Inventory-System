@@ -5,6 +5,7 @@ import { createClient as createSupabaseJs } from "@supabase/supabase-js";
 import { createAdminClient } from "@hamza/shared/supabase/admin";
 import { createClient } from "@hamza/shared/supabase/server";
 import { getCurrentUser } from "@hamza/shared/auth";
+import { selectAll } from "@/lib/fetch-all";
 
 async function requireOwner() {
   const user = await getCurrentUser();
@@ -22,7 +23,7 @@ async function mergeJson(db: ReturnType<typeof createAdminClient>, column: "stor
 export async function updateStoreProfile(input: {
   store_name: string; currency: string; tax_percent: number;
   address?: string; phone?: string; ntn?: string;
-  receipt_header?: string; receipt_footer?: string; logo_url?: string;
+  receipt_header?: string; receipt_footer?: string; receipt_disclaimer?: string; logo_url?: string;
 }) {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
   const db = createAdminClient();
@@ -32,19 +33,42 @@ export async function updateStoreProfile(input: {
   if (error) return { error: error.message };
   await mergeJson(db, "store_info", {
     address: input.address ?? "", phone: input.phone ?? "", ntn: input.ntn ?? "",
-    receipt_header: input.receipt_header ?? "", receipt_footer: input.receipt_footer ?? "", logo_url: input.logo_url ?? "",
+    receipt_header: input.receipt_header ?? "", receipt_footer: input.receipt_footer ?? "",
+    // Phase F — blank means "use the built-in default" at render time, so the
+    // admin can clear the field without ending up with no disclaimer at all.
+    receipt_disclaimer: input.receipt_disclaimer ?? "", logo_url: input.logo_url ?? "",
   });
+  // The store logo / name / address live in the SHARED admin layout (sidebar +
+  // header, on every page) and are read fresh into POS receipts. Revalidating
+  // only /admin/settings left the cached logo on all other routes — so a new
+  // logo appeared to "not take effect". Revalidate the whole admin layout so the
+  // new logo shows immediately everywhere (headers + invoices/receipts).
+  revalidatePath("/admin", "layout");
   revalidatePath("/admin/settings");
   return { ok: true };
 }
 
 /* ---------------- Store logo upload ---------------- */
 // Reuses the same working Storage mechanism as product photos: one file →
-// public bucket → public URL. The URL is returned so the StoreSection form can
-// persist it on Save (settings.store_info.logo_url), exactly like a pasted URL.
+// public bucket → public URL. Each upload gets a UNIQUE path (so the URL always
+// changes and no browser/CDN can serve a stale cached image), and the new URL is
+// persisted to settings.store_info.logo_url IMMEDIATELY here — not deferred to a
+// separate "Save profile" click. That two-step gap was the bug: uploads landed
+// in storage but the settings record kept pointing at the old logo, so every
+// reader (header, invoice, settings) showed the previous image.
 const LOGO_BUCKET = "product-images";
 const LOGO_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/avif"];
 const LOGO_MAX_BYTES = 5_242_880; // 5 MB
+
+/** Persist the store logo reference and refresh everywhere it's shown. */
+async function persistLogo(db: ReturnType<typeof createAdminClient>, url: string) {
+  await mergeJson(db, "store_info", { logo_url: url });
+  // Logo lives in the SHARED admin layout (header on every page) and is read
+  // into POS/reprint receipts — revalidate the whole admin layout so the new
+  // logo appears immediately without a hard refresh.
+  revalidatePath("/admin", "layout");
+  revalidatePath("/admin/settings");
+}
 
 export async function uploadLogo(formData: FormData): Promise<{ url: string } | { error: string }> {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
@@ -60,7 +84,16 @@ export async function uploadLogo(formData: FormData): Promise<{ url: string } | 
     upsert: true, contentType: file.type, cacheControl: "31536000",
   });
   if (error) return { error: error.message || "Upload failed — please try again." };
-  return { url: db.storage.from(LOGO_BUCKET).getPublicUrl(path).data.publicUrl };
+  const url = db.storage.from(LOGO_BUCKET).getPublicUrl(path).data.publicUrl;
+  await persistLogo(db, url);
+  return { url };
+}
+
+/** Clear the store logo (persisted immediately, mirrors uploadLogo). */
+export async function removeLogo(): Promise<{ ok: true } | { error: string }> {
+  if (!(await requireOwner())) return { error: "Only the owner can change settings." };
+  await persistLogo(createAdminClient(), "");
+  return { ok: true };
 }
 
 /* ---------------- Inventory settings ---------------- */
@@ -81,14 +114,21 @@ export async function updateInventorySettings(input: {
 /* ---------------- Sales settings ---------------- */
 export async function updateSalesSettings(input: {
   tax_percent: number; rounding: string; receipt_template: string; allow_discounts: boolean;
+  /** Phase H — days after a sale that a return is still accepted (0 = no limit). */
+  return_window_days?: number;
 }) {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
   const db = createAdminClient();
   await db.from("settings").update({ tax_percent: input.tax_percent }).eq("id", 1);
   await mergeJson(db, "store_info", {
     sales: { rounding: input.rounding, receipt_template: input.receipt_template, allow_discounts: input.allow_discounts },
+    // Kept at the TOP level of store_info because that is where the returns
+    // flow already reads it from — moving it under `sales` would silently
+    // orphan any value a store has already saved.
+    ...(input.return_window_days !== undefined ? { return_window_days: input.return_window_days } : {}),
   });
   revalidatePath("/admin/settings");
+  revalidatePath("/admin/pos");
   return { ok: true };
 }
 
@@ -192,11 +232,12 @@ export async function changePassword(currentPassword: string, newPassword: strin
 export async function exportProductsCSV(): Promise<{ csv: string } | { error: string }> {
   if (!(await requireOwner())) return { error: "Only the owner can export data." };
   const db = createAdminClient();
+  // Paged so a full backup export never stops at the 1000-row cap.
   const [{ data: variants }, { data: products }, { data: avail }, { data: barcodes }] = await Promise.all([
-    db.from("product_variants").select("id, product_id, sku, cost, sale_price"),
-    db.from("products").select("id, name"),
-    db.from("variant_availability").select("variant_id, on_hand"),
-    db.from("product_barcodes").select("variant_id, barcode, is_primary"),
+    selectAll((from, to) => db.from("product_variants").select("id, product_id, sku, cost, sale_price").order("id").range(from, to)),
+    selectAll((from, to) => db.from("products").select("id, name").order("id").range(from, to)),
+    selectAll((from, to) => db.from("variant_availability").select("variant_id, on_hand").order("variant_id").range(from, to)),
+    selectAll((from, to) => db.from("product_barcodes").select("variant_id, barcode, is_primary").order("id").range(from, to)),
   ]);
   const pName = new Map((products ?? []).map((p) => [p.id, p.name]));
   const onHand = new Map((avail ?? []).map((a) => [a.variant_id, Number(a.on_hand)]));

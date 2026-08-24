@@ -41,6 +41,7 @@ function done() {
   revalidatePath("/admin/stock");
   revalidatePath("/admin/products");
   revalidatePath("/admin/dashboard");
+  revalidatePath("/admin/reports");
   return { ok: true as const };
 }
 

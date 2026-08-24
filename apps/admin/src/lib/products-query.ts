@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { selectAll } from "./fetch-all";
 
 // Server-side paginated products query. Both the SSR page (first page) and the
 // "load more" / search server action call this, so a product list never loads
@@ -56,7 +57,15 @@ export interface ProductsPage {
 
 export interface ProductsQuery {
   q?: string;
+  /** Single-category filter. Kept for existing callers; prefer categoryIds. */
   categoryId?: string;
+  /**
+   * Phase I — multi-select category filter. Already EXPANDED by the caller so a
+   * selected main category includes its sub-categories (see
+   * lib/categories.expandCategorySelection, the same helper Low Stock uses).
+   * An empty/omitted list means "all categories", unchanged from before.
+   */
+  categoryIds?: string[];
   /** Fetch exactly one product by id (used when the scanner opens it to edit). */
   productId?: string;
   offset?: number;
@@ -86,7 +95,8 @@ export async function fetchProductsPage(supabase: SupabaseClient<any>, params: P
     .order("id")
     .range(offset, offset + limit - 1);
   if (params.productId) pq = pq.eq("id", params.productId);
-  if (params.categoryId) pq = pq.eq("category_id", params.categoryId);
+  if (params.categoryIds?.length) pq = pq.in("category_id", params.categoryIds);
+  else if (params.categoryId) pq = pq.eq("category_id", params.categoryId);
   if (term) pq = pq.or(`name.ilike.%${term}%,brand.ilike.%${term}%,sku.ilike.%${term}%`);
 
   const { data: products, count, error } = await pq;
@@ -95,23 +105,28 @@ export async function fetchProductsPage(supabase: SupabaseClient<any>, params: P
   const ids = (products ?? []).map((p) => p.id as string);
   if (!ids.length) return { rows: [], total: count ?? 0, offset, limit };
 
-  // 2. related rows for ONLY this page's products
+  // 2. related rows for ONLY this page's products. Each `.in(ids)` read is paged
+  // (selectAll) with a stable order so a large page (e.g. a bulk export chunk)
+  // never silently stops at PostgREST's 1000-row cap — a page's variants /
+  // barcodes / availability all load in full no matter how many there are.
   const [{ data: categories }, { data: variants }, { data: options }, { data: optionValues }] = await Promise.all([
     supabase.from("categories").select("id, name, parent_id"),
-    supabase
+    selectAll((from, to) => supabase
       .from("product_variants")
       .select("id, product_id, sku, cost, sale_price, reorder_point, default_discount_type, default_discount_value, is_default, active, image_url")
       .in("product_id", ids)
-      .order("is_default", { ascending: false }),
+      .order("is_default", { ascending: false }).order("id").range(from, to)),
     supabase.from("product_options").select("id, product_id, name, sort").in("product_id", ids).order("sort"),
-    supabase.from("product_option_values").select("id, option_id, value, sort"),
+    // Paged so option-value labels stay complete once the catalogue's variant
+    // options exceed 1000 rows overall.
+    selectAll((from, to) => supabase.from("product_option_values").select("id, option_id, value, sort").order("id").range(from, to)),
   ]);
 
   const variantIds = (variants ?? []).map((v) => v.id as string);
   const [{ data: availability }, { data: barcodes }, { data: vov }] = await Promise.all([
-    supabase.from("variant_availability").select("variant_id, on_hand, reserved, available, avg_cost").in("variant_id", variantIds),
-    supabase.from("product_barcodes").select("variant_id, barcode, is_primary").in("variant_id", variantIds),
-    supabase.from("variant_option_values").select("variant_id, option_value_id").in("variant_id", variantIds),
+    selectAll((from, to) => supabase.from("variant_availability").select("variant_id, on_hand, reserved, available, avg_cost").in("variant_id", variantIds).order("variant_id").range(from, to)),
+    selectAll((from, to) => supabase.from("product_barcodes").select("variant_id, barcode, is_primary").in("variant_id", variantIds).order("variant_id").order("barcode").range(from, to)),
+    selectAll((from, to) => supabase.from("variant_option_values").select("variant_id, option_value_id").in("variant_id", variantIds).order("variant_id").order("option_value_id").range(from, to)),
   ]);
 
   const catName = new Map((categories ?? []).map((c) => [c.id, c.name as string]));
@@ -186,4 +201,28 @@ export async function fetchProductsPage(supabase: SupabaseClient<any>, params: P
   });
 
   return { rows, total: count ?? 0, offset, limit };
+}
+
+// Chunk size for a full-catalogue read (export). Kept moderate so each page's
+// parent `.range(...)` and its related `.in(ids)` reads both stay well under
+// PostgREST's 1000-row cap and the URL stays short — the loop then walks through
+// the ENTIRE (optionally filtered) catalogue, so nothing is dropped up to
+// 15,000+ products.
+const EXPORT_CHUNK = 200;
+
+/**
+ * Fetch EVERY product (optionally filtered by search / category) by walking the
+ * paginated {@link fetchProductsPage} in {@link EXPORT_CHUNK}-sized pages. Used
+ * by the Products export so the file reflects the full set, not just the first
+ * 1000 rows a single unbounded query would return.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function fetchAllProducts(supabase: SupabaseClient<any>, params: ProductsQuery = {}): Promise<ProductRow[]> {
+  const out: ProductRow[] = [];
+  for (let offset = 0; ; offset += EXPORT_CHUNK) {
+    const page = await fetchProductsPage(supabase, { ...params, offset, limit: EXPORT_CHUNK });
+    out.push(...page.rows);
+    if (page.rows.length < EXPORT_CHUNK || out.length >= page.total) break;
+  }
+  return out;
 }

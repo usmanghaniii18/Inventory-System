@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Search, ShoppingCart, Plus, Minus, Trash2, X, Banknote,
   Loader2, Package, ScanLine, Camera, CheckCircle2, AlertTriangle, RotateCcw,
@@ -27,7 +28,8 @@ import { enqueueSale, getQueue, removeFromQueue, queueCount, type QueuedSalePayl
 import { computeTotals, unitDiscount, round2 as round2px } from "@hamza/shared/pricing";
 import { computePromotions, type Promotion, type PromoResult } from "@hamza/shared/discounts";
 import { type ReceiptData } from "@/lib/receipt";
-import { printReceiptHtml } from "@/lib/receipt-html";
+import { printReceiptHtml, isPrintableReceipt } from "@/lib/receipt-html";
+import { resolveShortcut, isCharacterKey, SHORTCUT_HELP, RETIRED_KEYS, type PosAction } from "@/lib/pos-shortcuts";
 
 /** Cart line: qty + a per-line discount (rupees). `manual` is set once the
  *  cashier edits/removes it, so it stops tracking the product's default. */
@@ -46,10 +48,32 @@ export interface StoreSettings {
   logo_url?: string;
   receipt_header?: string;
   receipt_footer?: string;
+  /** Store-set disclaimer printed on every receipt (Phase F). */
+  receipt_disclaimer?: string;
   tax_percent: number;
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/**
+ * A field the cashier is deliberately typing into, which the scan box must not
+ * steal focus from. The scan/search box itself is excluded (it IS the resting
+ * place), so re-focusing it is always allowed.
+ */
+function isDeliberateField(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  if (el.dataset?.scanBox === "1") return false; // the scan box IS the resting place
+  if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable) return true;
+  // A control the cashier reached with the KEYBOARD (Tab) is also off limits —
+  // :focus-visible is set for keyboard focus but not for a mouse click, which is
+  // exactly the distinction we want: never yank focus mid-Tab-navigation, but do
+  // reclaim it from a button that was merely clicked.
+  try {
+    return el.matches(":focus-visible");
+  } catch {
+    return false;
+  }
+}
 
 // ---- Hold / resume: parked carts persisted per-device in localStorage --------
 interface HeldSale {
@@ -126,7 +150,16 @@ export function PosClient({
   categoryParents?: Record<string, string | null>;
 }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const toast = useToast();
+
+  // A completed sale (or synced offline sale) changed on-hand in the DB. Besides
+  // re-rendering server components (router.refresh), drop the session-cached
+  // ["products"] TanStack data so the Products tab reflects the new stock the
+  // moment the cashier switches to it — no manual refresh.
+  const invalidateStockViews = () => {
+    queryClient.invalidateQueries({ queryKey: ["products"] });
+  };
 
   // Local catalogue cache: instant scan/search, live stock, works offline.
   // Falls back to the server-rendered props until the cache has hydrated.
@@ -169,6 +202,16 @@ export function PosClient({
   const [receiptData, setReceiptData] = useState<ReceiptData | null>(null);
   const [lastReceipt, setLastReceipt] = useState<ReceiptData | null>(null);
   const [highlight, setHighlight] = useState(0);
+  // ---- Phase B: fast keyboard qty/discount entry -------------------------
+  // Exactly ONE cart line is ever in edit mode, so a single pair of inputs is
+  // rendered (inside that line) and a single pair of refs owns focus. That is
+  // what makes the flow safe with many lines in the cart: there is no per-line
+  // input to mis-target, and nothing to shift focus onto a neighbouring line.
+  const [editing, setEditing] = useState<{ id: string; field: "qty" | "disc" } | null>(null);
+  const [qtyDraft, setQtyDraft] = useState("");
+  const [discDraft, setDiscDraft] = useState("");
+  // The line a bare F3 targets: the one most recently scanned / added / edited.
+  const [activeLine, setActiveLine] = useState<string | null>(null);
   const [held, setHeld] = useState<HeldSale[]>([]);
   const [heldOpen, setHeldOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -176,10 +219,40 @@ export function PosClient({
   const [queued, setQueued] = useState(0);
   const flushing = useRef(false);
   const idemKey = useRef("");
+  // Synchronous in-flight guard for the F9 fast path. `processing` is React
+  // state, so two F9 presses in the same tick would both still observe it as
+  // false and fire two checkouts; a ref flips immediately and is the only thing
+  // that can actually stop a double charge.
+  const charging = useRef(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [lastScan, setLastScan] = useState<{ ok: boolean; text: string } | null>(null);
   const scanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+
+  // ---- Phase A: the POS shell is sized to the REAL space left under the
+  // sticky topbar, measured rather than assumed. The old fixed
+  // `h-[calc(100vh-7rem)]` guessed the chrome height; whenever the guess was
+  // even a few pixels short the shell overflowed and the whole PAGE scrolled
+  // instead of the panels. Measuring (and re-measuring on resize/zoom) keeps
+  // the header, totals and action buttons pinned no matter how long the cart
+  // gets — only the product list and the cart list scroll, each on its own.
+  const shellRef = useRef<HTMLDivElement>(null);
+  const [shellHeight, setShellHeight] = useState<number | undefined>();
+  useEffect(() => {
+    const measure = () => {
+      const el = shellRef.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY - window.scrollY;
+      // Leave the shell's own bottom gutter (the admin <main> pb-6 = 24px).
+      const h = Math.max(360, Math.round(window.innerHeight - top - 24));
+      setShellHeight((prev) => (prev === h ? prev : h));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    if (ro && shellRef.current?.parentElement) ro.observe(shellRef.current.parentElement);
+    return () => { window.removeEventListener("resize", measure); ro?.disconnect(); };
+  }, []);
   const byId = useMemo(() => new Map(products.map((p) => [p.variant_id, p])), [products]);
   const byBarcode = useMemo(() => {
     const m = new Map<string, PosProduct>();
@@ -218,6 +291,7 @@ export function PosClient({
   }
 
   function add(p: PosProduct, delta = 1) {
+    setActiveLine(p.variant_id); // F3 edits the line you just scanned
     setCart((c) => {
       const next = new Map(c);
       const entry = next.get(p.variant_id);
@@ -264,10 +338,92 @@ export function PosClient({
     });
   }
 
-  // Single resolve path for every input: hardware scanner, camera, or typed code.
-  function handleScan(raw: string) {
+  // ---- Phase B: quantity + discount without repeated clicking -------------
+  // Flow: F3 (or clicking a cart line) → Qty input → Enter → Discount input →
+  // Enter → both applied, focus back on the scan box ready for the next scan.
+  /** Put focus back on the scan/search box and leave edit mode. */
+  function focusScan() {
+    setEditing(null);
+    // after the edit inputs unmount, so the browser doesn't steal focus back
+    requestAnimationFrame(() => searchRef.current?.focus());
+  }
+
+  /** Return focus to the scan box after an action, without leaving edit mode. */
+  function focusScanSoon() {
+    requestAnimationFrame(() => {
+      const el = searchRef.current;
+      if (!el || document.activeElement === el) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (isDeliberateField(active)) return; // never steal a field being typed in
+      el.focus();
+    });
+  }
+
+  /** Enter quantity-edit mode for a cart line (defaults to the active line). */
+  function beginEdit(id?: string) {
+    const target = id ?? activeLine ?? [...cart.keys()].at(-1);
+    if (!target) return;
+    const entry = cart.get(target);
+    if (!entry) return;
+    setActiveLine(target);
+    setQtyDraft(String(entry.qty));
+    setDiscDraft(entry.discount ? String(round2(entry.discount)) : "");
+    setEditing({ id: target, field: "qty" });
+  }
+
+  /** Apply the typed quantity and advance to this same line's discount. */
+  function commitQty() {
+    if (!editing) return;
+    const entry = cart.get(editing.id);
+    if (!entry) return focusScan();
+    const raw = qtyDraft.trim();
+    const n = raw === "" ? entry.qty : Number(raw);
+    if (!Number.isFinite(n) || n < 0) { beepError(); return; }
+    if (n <= 0) { setQty(editing.id, 0); beepOk(); return focusScan(); } // 0 removes the line
+    // Clamp to what's actually on hand so checkout can't fail on stock later.
+    const capped = Math.min(n, entry.p.available);
+    if (capped < n) flash(false, `Only ${entry.p.available} of ${entry.p.name} in stock`);
+    setQty(editing.id, capped);
+    setQtyDraft(String(capped));
+    setEditing({ id: editing.id, field: "disc" });
+  }
+
+  /** Apply the typed discount (blank = 0) and hand focus back to the scan box. */
+  function commitDisc() {
+    if (!editing) return;
+    const raw = discDraft.trim();
+    const n = raw === "" ? 0 : Number(raw);
+    if (!Number.isFinite(n) || n < 0) { beepError(); return; }
+    if (n === 0) clearLineDiscount(editing.id);
+    else setLineDiscount(editing.id, n);
+    beepOk();
+    focusScan();
+  }
+
+  // ---- Phase D: ONE add-to-cart path for every way an item can arrive -----
+  // A hardware scan, a camera scan, a typed barcode, a product name typed into
+  // the search box and a clicked card all funnel through addResolved(), so they
+  // share the identical stock check, beep, on-screen confirmation, search reset
+  // and scan-box refocus. Previously the search box had its own separate path that only
+  // fired when the typed text matched exactly ONE product, which is why
+  // "type a name + Enter" so often did nothing.
+  function addResolved(p: PosProduct, qty = 1, note?: string): boolean {
+    if (p.available <= 0) {
+      beepError();
+      flash(false, `${p.name} is out of stock`);
+      return false;
+    }
+    add(p, qty);
+    setQ("");
+    beepOk();
+    flash(true, note ?? `Added ${p.name}`);
+    focusScanSoon();
+    return true;
+  }
+
+  /** Resolve a code against the barcode indexes (tolerant of leading zeros). */
+  function findByBarcode(raw: string): { p?: PosProduct; parsed: ReturnType<typeof parseScan> } {
     const parsed = parseScan(raw);
-    // leading-zero / string-vs-number tolerant fallback for numeric barcodes
     const looseBarcode = (code: string): PosProduct | undefined => {
       if (!/^\d+$/.test(code)) return undefined;
       const bare = code.replace(/^0+/, "") || "0";
@@ -281,44 +437,72 @@ export function PosClient({
       (barcodeIndex[parsed.barcode] ? byId.get(barcodeIndex[parsed.barcode]) : undefined) ||
       looseBarcode(parsed.lookupKey) ||
       looseBarcode(parsed.barcode);
+    return { p, parsed };
+  }
 
+  // Single resolve path for MACHINE input: hardware scanner, camera, or a code
+  // typed into the box. Deliberately strict — an unrecognised code is reported,
+  // never guessed at, so a mis-read never silently bills the wrong item.
+  function handleScan(raw: string) {
+    const { p, parsed } = findByBarcode(raw);
     if (!p) {
-      // not a known barcode — fall back to a unique text-search match
+      // still allow an unambiguous text match (e.g. a typed SKU)
       const t = raw.trim().toLowerCase();
       const matches = products.filter(
         (x) => x.name.toLowerCase().includes(t) || x.sku.toLowerCase().includes(t) || (x.barcode ?? "").includes(t),
       );
-      if (matches.length === 1) {
-        add(matches[0]);
-        setQ("");
-        beepOk();
-        flash(true, `Added ${matches[0].name}`);
-        return;
-      }
+      if (matches.length === 1) { addResolved(matches[0]); return; }
       beepError();
       flash(false, `Unknown code: ${parsed.barcode}`);
+      focusScanSoon();
       return;
     }
-
-    if (p.available <= 0) {
-      beepError();
-      flash(false, `${p.name} is out of stock`);
-      return;
-    }
-
     const qty = parsed.isWeightEmbedded && parsed.weight ? parsed.weight : 1;
-    add(p, qty);
-    setQ("");
-    beepOk();
-    flash(true, parsed.isWeightEmbedded ? `${p.name} · ${qty.toFixed(3)} kg` : `Added ${p.name}`);
+    addResolved(p, qty, parsed.isWeightEmbedded ? `${p.name} · ${qty.toFixed(3)} kg` : undefined);
+  }
+
+  /**
+   * Enter in the search box. Tries the barcode indexes first (so a hand-typed
+   * barcode behaves exactly like a scan), then falls back to the product the
+   * cashier is actually looking at: the highlighted card when it's still in the
+   * result list, otherwise the best match in the current (category-filtered)
+   * results — exact SKU/name first, then a name that starts with the term, then
+   * the top result. Whatever it picks goes through the same addResolved().
+   */
+  function submitSearch() {
+    const term = q.trim();
+    if (!term) {
+      const p = filtered[highlight]; // Enter on an empty box adds the highlighted card
+      if (p) addResolved(p);
+      return;
+    }
+
+    const { p: byCode } = findByBarcode(term);
+    if (byCode) { handleScan(term); return; }
+
+    const t = term.toLowerCase();
+    const pool = filtered.length ? filtered : products.filter(
+      (x) => x.name.toLowerCase().includes(t) || x.label.toLowerCase().includes(t) || x.sku.toLowerCase().includes(t) || (x.barcode ?? "").includes(t),
+    );
+    if (!pool.length) {
+      beepError();
+      flash(false, `No product matches “${term}”`);
+      return;
+    }
+    const exact = pool.find((x) => x.sku.toLowerCase() === t || x.name.toLowerCase() === t);
+    const highlighted = filtered[highlight];
+    const starts = pool.find((x) => x.name.toLowerCase().startsWith(t));
+    const pick = exact
+      ?? (highlighted && pool.includes(highlighted) ? highlighted : undefined)
+      ?? starts
+      ?? pool[0];
+    addResolved(pick);
   }
 
   function onScan(e: React.KeyboardEvent) {
     if (e.key !== "Enter") return;
     e.preventDefault();
-    if (q.trim()) { handleScan(q); return; }
-    const p = filtered[highlight]; // Enter on an empty box adds the highlighted card
-    if (p && p.available > 0) { add(p); flash(true, `Added ${p.name}`); }
+    submitSearch();
   }
 
   // Own scans while POS is open (the global scan-anywhere sheet is suppressed).
@@ -359,8 +543,22 @@ export function PosClient({
     setPaymentOpen(true);
   }
 
-  async function checkout(payments: PaymentInput[], change: number) {
-    if (!lines.length) return;
+  /**
+   * The ONE checkout path. Both the manual payment sheet and the F9 fast cash
+   * path call this — same server action, same stock validation, same stock
+   * moves, same receipt construction. `autoPrint` only changes what happens
+   * AFTER the sale is recorded: the manual flow shows the receipt dialog, the
+   * fast path prints straight away and resets for the next customer.
+   *
+   * Returns true when the sale was recorded (or queued offline), false when it
+   * was rejected — so the fast path knows whether to confirm or stay put.
+   */
+  async function checkout(
+    payments: PaymentInput[],
+    change: number,
+    { autoPrint = false }: { autoPrint?: boolean } = {},
+  ): Promise<boolean> {
+    if (!lines.length) return false;
     const cartLines = lines; // snapshot for the receipt before we clear
     const cust = allCustomers.find((c) => c.id === customerId) ?? null;
     // The free-typed name (or the linked customer's name) saved on the sale.
@@ -377,6 +575,7 @@ export function PosClient({
       store: {
         name: store.name, address: store.address, phone: store.phone, logo_url: store.logo_url,
         header: store.receipt_header, footer: store.receipt_footer, ntn: store.ntn,
+        disclaimer: store.receipt_disclaimer,
       },
       receipt_no: receiptNo,
       date: new Date().toLocaleString("en-PK", { dateStyle: "medium", timeStyle: "short" }),
@@ -393,25 +592,80 @@ export function PosClient({
       if (typeof navigator !== "undefined" && !navigator.onLine) throw new Error("offline");
       const res = await checkoutSale({ ...payload, idempotency_key: idemKey.current });
       setProcessing(false);
-      if ("error" in res) return toast(res.error, "error"); // real rejection — keep the cart
-      finishSale(makeReceipt(res.receipt_no, res.subtotal, res.discount, res.tax, res.total));
+      if ("error" in res) {
+        // A real rejection — insufficient stock, a payment mismatch, an auth
+        // failure. The cart is deliberately KEPT so nothing is lost and nothing
+        // partial was charged. Identical for both paths.
+        toast(res.error, "error");
+        return false;
+      }
+      finishSale(makeReceipt(res.receipt_no, res.subtotal, res.discount, res.tax, res.total), autoPrint);
       void ensureCatalog({ force: true });
       router.refresh();
+      invalidateStockViews();
+      return true;
     } catch {
       // network unreachable — queue locally and print a provisional receipt
       await enqueueSale({ idempotency_key: idemKey.current, ts: Date.now(), payload });
       setProcessing(false);
-      finishSale(makeReceipt(`OFFLINE-${idemKey.current.slice(0, 8)}`, subtotal, disc, tax, total));
+      finishSale(makeReceipt(`OFFLINE-${idemKey.current.slice(0, 8)}`, subtotal, disc, tax, total), autoPrint);
       void refreshQueue();
       toast("Offline — sale queued, will sync on reconnect", "error");
+      return true;
     }
   }
 
-  function finishSale(receipt: ReceiptData) {
-    setReceiptData(receipt);
-    setLastReceipt(receipt); // kept for F6 after the modal closes
+  /**
+   * F9 fast path — the common case, a plain cash sale, in one keystroke.
+   *
+   * Charges the cart as CASH through the very same checkout() above (so stock
+   * validation, the ledger and the receipt are all identical to the manual
+   * flow), prints immediately, and resets for the next customer. Anything that
+   * is NOT a plain cash sale — udhaar, JazzCash, Easypaisa, a split tender —
+   * still goes through the Charge button / F4 payment sheet.
+   */
+  async function fastCashCheckout() {
+    // Guard order matters: the synchronous ref first, so a second F9 in the
+    // same tick cannot slip past while the first is still awaiting the server.
+    if (charging.current || processing) return;
+    if (!lines.length) return;
+    charging.current = true;
+    const amount = round2(total); // snapshot — the cart is cleared on success
+    try {
+      idemKey.current = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+      const ok = await checkout([{ method: "CASH", amount }], 0, { autoPrint: true });
+      if (ok) {
+        beepOk();
+        flash(true, `Charged Cash — ${formatPKR(amount)}`);
+      } else {
+        beepError(); // checkout() already surfaced the reason as a toast
+      }
+    } finally {
+      charging.current = false;
+    }
+  }
+
+  function finishSale(receipt: ReceiptData, autoPrint = false) {
+    setLastReceipt(receipt); // kept so F9 can reprint after the sale is done
     setPaymentOpen(false);
     setCart(new Map()); setDiscount("");
+
+    if (!autoPrint) {
+      setReceiptData(receipt); // manual flow: show the receipt dialog as before
+      return;
+    }
+
+    // Fast path: no dialog at all. Print, clear the customer and hand focus back
+    // to the scan box — the same reset finishReceipt() performs when the dialog
+    // is dismissed, just without requiring the dismissal.
+    setReceiptData(null);
+    setCustomer("", "");
+    try {
+      printReceiptHtml(receipt);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Sale saved, but the receipt could not be opened for printing", "error");
+    }
+    focusScanSoon();
   }
 
   async function refreshQueue() { setQueued(await queueCount()); }
@@ -435,6 +689,7 @@ export function PosClient({
       await refreshQueue();
       void ensureCatalog({ force: true });
       router.refresh();
+      invalidateStockViews();
     }
   }
 
@@ -456,6 +711,40 @@ export function PosClient({
     setCustomer("", "");
     searchRef.current?.focus();
   }
+
+  // ---- Phase D: the scan box is ALWAYS ready ------------------------------
+  // Root cause of "press F2 first, then it scans": the hardware-wedge listener
+  // decides a burst is a scan purely from keystroke timing. When it judged a
+  // burst too slow (a slower scanner, a jittery USB hub, a busy render) the
+  // characters fell through to whatever had focus — and if that was a button or
+  // the document body, they went nowhere and the scan was silently lost. F2
+  // "fixed" it because it put focus back in the search box, where the fallback
+  // path (characters land in the field, Enter submits it) works.
+  //
+  // So the search box is kept focused as the app's resting state: after adding
+  // an item, after any dialog closes, when the tab or window regains focus, and
+  // on a low-frequency self-heal sweep for anything else that stole it. It
+  // never takes focus away from a field the cashier deliberately typed into
+  // (the quantity/discount inputs, the customer box, the payment amounts).
+  const anyOverlayOpen = paymentOpen || returnsOpen || cameraOpen || !!receiptData || heldOpen || shortcutsOpen;
+  useEffect(() => {
+    if (anyOverlayOpen || editing) return;
+    const refocus = () => {
+      const el = searchRef.current;
+      if (!el || document.activeElement === el) return;
+      if (isDeliberateField(document.activeElement as HTMLElement | null)) return;
+      el.focus();
+    };
+    refocus();
+    const heal = window.setInterval(refocus, 800);
+    window.addEventListener("focus", refocus);
+    document.addEventListener("visibilitychange", refocus);
+    return () => {
+      window.clearInterval(heal);
+      window.removeEventListener("focus", refocus);
+      document.removeEventListener("visibilitychange", refocus);
+    };
+  }, [anyOverlayOpen, editing]);
 
   // ---- Hold / resume ----
   function holdSale() {
@@ -498,44 +787,183 @@ export function PosClient({
     setHeld(next); saveHeld(next);
   }
 
-  // ---- Keyboard shortcuts (full keyboard-only billing) ----
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const t = e.target as HTMLElement | null;
-      const inField = !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
-      const anyModal = paymentOpen || returnsOpen || cameraOpen || !!receiptData;
-
-      switch (e.key) {
-        case "F2": e.preventDefault(); searchRef.current?.focus(); return;
-        case "F4": e.preventDefault(); if (!anyModal && cart.size) openPayment(); return;
-        case "F6": e.preventDefault(); if (lastReceipt) printReceiptHtml(lastReceipt); return;
-        case "Escape":
-          if (shortcutsOpen) return setShortcutsOpen(false);
-          if (heldOpen) return setHeldOpen(false);
-          if (!anyModal && cart.size) { setCart(new Map()); setDiscount(""); flash(false, "Sale cleared"); }
-          return;
-      }
-      if (anyModal) return;
-      if (e.key === "?" && !inField) { e.preventDefault(); setShortcutsOpen((s) => !s); return; }
-      if (e.key === "ArrowDown" || e.key === "ArrowRight") { e.preventDefault(); setHighlight((h) => Math.min(h + 1, filtered.length - 1)); return; }
-      if (e.key === "ArrowUp" || e.key === "ArrowLeft") { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); return; }
-      if ((e.key === "+" || e.key === "=") && (!inField || q === "")) { e.preventDefault(); const p = filtered[highlight]; if (p && p.available > 0) add(p, 1); return; }
-      if ((e.key === "-" || e.key === "_") && (!inField || q === "")) { e.preventDefault(); const p = filtered[highlight]; if (p) add(p, -1); return; }
+  // ---- Phase C: print the bill straight from the billing screen ----------
+  // The receipt that F9 / Ctrl+P prints: the sale just completed if its modal
+  // is still up, otherwise the last one printed this session.
+  function printCurrentReceipt() {
+    const target = receiptData ?? lastReceipt;
+    // Two separate conditions, deliberately: nothing to print at all, versus a
+    // receipt that exists but has no lines. Both must be a message, never a
+    // throw — an exception raised inside a keydown handler is not caught by
+    // React's event machinery and takes the whole screen down to the route
+    // error boundary.
+    if (!isPrintableReceipt(target)) {
+      flash(false, target ? "That bill has no items to print" : "Nothing to print yet");
+      return;
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paymentOpen, returnsOpen, cameraOpen, receiptData, shortcutsOpen, heldOpen, cart, q, filtered, highlight, lastReceipt]);
+    try {
+      printReceiptHtml(target);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Could not open the receipt for printing", "error");
+    }
+  }
+
+  // ---- Keyboard shortcuts -------------------------------------------------
+  // Run one resolved action. Every branch gives FEEDBACK: the old handler
+  // silently did nothing when the cart was empty or no receipt existed yet,
+  // which on a freshly loaded till is most keys, most of the time — and is
+  // indistinguishable from "the shortcut is broken".
+  function runShortcut(action: PosAction) {
+    const anyModal = paymentOpen || returnsOpen || cameraOpen || !!receiptData;
+    switch (action) {
+      case "focusScan":
+        focusScan();
+        flash(true, "Ready to scan");
+        return;
+      case "editLine":
+        if (anyModal) return;
+        if (!cart.size) { beepError(); flash(false, "Cart is empty — scan an item first"); return; }
+        beginEdit();
+        return;
+      case "checkout":
+        if (anyModal) return;
+        if (!cart.size) { beepError(); flash(false, "Cart is empty — nothing to charge"); return; }
+        openPayment();
+        return;
+      case "print":
+        // F9 is state-aware. An uncharged cart with items means "charge this as
+        // cash and print it"; anything else means "print / reprint what's
+        // already been charged". A modal open means the cashier is mid manual
+        // flow, so the fast path stays out of the way.
+        if (!anyModal && lines.length) { void fastCashCheckout(); return; }
+        printCurrentReceipt();
+        return;
+      case "printOnly":
+        // Ctrl+P — reprint only, never a charge. See pos-shortcuts.ts.
+        printCurrentReceipt();
+        return;
+      case "clearOrCancel":
+        if (shortcutsOpen) { setShortcutsOpen(false); return; }
+        if (heldOpen) { setHeldOpen(false); return; }
+        if (editing) { focusScan(); return; }
+        if (anyModal) return;
+        if (cart.size) { setCart(new Map()); setDiscount(""); flash(false, "Sale cleared"); }
+        return;
+      case "toggleHelp":
+        if (anyModal) return;
+        setShortcutsOpen((v) => !v);
+        return;
+      case "moveNext":
+        if (anyModal) return;
+        setHighlight((h) => Math.min(h + 1, filtered.length - 1));
+        return;
+      case "movePrev":
+        if (anyModal) return;
+        setHighlight((h) => Math.max(h - 1, 0));
+        return;
+      case "incQty": {
+        if (anyModal) return;
+        const p = filtered[highlight];
+        if (p && p.available > 0) add(p, 1);
+        return;
+      }
+      case "decQty": {
+        if (anyModal) return;
+        const p = filtered[highlight];
+        if (p) add(p, -1);
+        return;
+      }
+      // The browser owns F3 / F6, so those are no longer bound to an action.
+      // If the keystroke does reach us, point the cashier at the new key.
+      case "legacyEditHint":
+        flash(false, `F3 is a browser key — press ${RETIRED_KEYS.F3.replacement} to edit quantity`);
+        return;
+      case "legacyPrintHint":
+        flash(false, `F6 is a browser key — press ${RETIRED_KEYS.F6.replacement} to print`);
+        return;
+    }
+  }
+
+  // The handler is re-created every render (it closes over current state), but
+  // the LISTENER below is registered exactly once. Routing through a ref is what
+  // makes that safe.
+  const shortcutRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  shortcutRef.current = (e: KeyboardEvent) => {
+    const t = e.target as HTMLElement | null;
+    const inCartEdit = !!t && typeof t.closest === "function" && !!t.closest("[data-cart-edit]");
+    const action = resolveShortcut(e, {
+      inCartEdit,
+      inField: !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable),
+      searchEmpty: q === "",
+      anyModal: paymentOpen || returnsOpen || cameraOpen || !!receiptData,
+    });
+
+    if (typeof window !== "undefined" && window.localStorage.getItem("posKeys") === "1") {
+      // Diagnostic mode: proves whether a keystroke reached the app at all, and
+      // what it was understood to mean. See the POS shortcut notes.
+      console.info("[pos-keys]", {
+        key: e.key, code: e.code, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey,
+        repeat: e.repeat, target: t?.tagName, inCartEdit, action: action ?? "(ignored)",
+      });
+    }
+
+    if (!action) return;
+    // Only ever preventDefault for a key we actually handle, so typing and the
+    // barcode wedge are untouched.
+    e.preventDefault();
+    runShortcut(action);
+  };
+
+  // Registered ONCE for the life of the page. The empty dependency array is the
+  // point: the previous version listed cart / q / filtered / highlight as
+  // dependencies, so the listener detached and reattached on almost every render
+  // and on every Fast Refresh — a window in which no shortcut worked at all.
+  //
+  // Two phases, deliberately:
+  //   capture — F-keys, Escape, arrows, Ctrl combos. First position in the event
+  //             path, so nothing downstream can swallow a shortcut.
+  //   bubble  — single printable characters (+ - = _ *). These must stay BEHIND
+  //             the hardware scanner's stopPropagation() shield, or every hyphen
+  //             in a scanned code like "GRO-SUG-1" would fire "decrease quantity".
+  useEffect(() => {
+    const onCapture = (e: KeyboardEvent) => { if (!isCharacterKey(e)) shortcutRef.current(e); };
+    const onBubble = (e: KeyboardEvent) => { if (isCharacterKey(e)) shortcutRef.current(e); };
+    window.addEventListener("keydown", onCapture, true);
+    window.addEventListener("keydown", onBubble, false);
+    return () => {
+      window.removeEventListener("keydown", onCapture, true);
+      window.removeEventListener("keydown", onBubble, false);
+    };
+  }, []);
 
   return (
-    <div className="grid h-[calc(100vh-7rem)] grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+    <div
+      ref={shellRef}
+      style={shellHeight ? { height: shellHeight } : undefined}
+      className={cn(
+        // The POS shell owns its own height so the PAGE never scrolls: the two
+        // panels below are the only scrollable areas (see Phase A notes).
+        "grid grid-cols-1 gap-4 overflow-hidden lg:grid-cols-[minmax(0,1fr)_380px]",
+        !shellHeight && "h-[calc(100dvh-7rem)]",
+      )}
+    >
       {/* product area */}
-      <div className="flex min-h-0 min-w-0 flex-col">
-        <div className="mb-3 flex items-center gap-2">
+      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+        <div className="mb-3 flex shrink-0 items-center gap-2">
           <div className="relative flex-1">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-tertiary" />
-            <Input ref={searchRef} autoFocus value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onScan}
-              placeholder="Scan barcode or search product…" className="h-12 pl-10 text-base" />
+            <Input
+              ref={searchRef}
+              data-scan-box="1"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              onKeyDown={onScan}
+              placeholder="Scan barcode or search product…"
+              className="h-12 pl-10 text-base"
+            />
           </div>
           <button
             type="button"
@@ -576,7 +1004,7 @@ export function PosClient({
 
         {/* offline / sync status */}
         {(!online || queued > 0) && (
-          <div className="mb-3 flex items-center gap-2 rounded-xl border border-amber-icon/30 bg-amber-tile px-3 py-2 text-sm text-amber-text">
+          <div className="mb-3 flex shrink-0 items-center gap-2 rounded-xl border border-amber-icon/30 bg-amber-tile px-3 py-2 text-sm text-amber-text">
             <WifiOff className="h-4 w-4 shrink-0" />
             <span className="flex-1">
               {online
@@ -594,7 +1022,7 @@ export function PosClient({
         {/* per-scan confirmation / warning */}
         {lastScan && (
           <div className={cn(
-            "mb-3 flex items-center gap-2 rounded-xl border px-3 py-2 text-sm animate-fade-in",
+            "mb-3 flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-sm animate-fade-in",
             lastScan.ok
               ? "border-green-icon/30 bg-green-tile text-green-text"
               : "border-coral-icon/30 bg-coral-tile text-coral-text",
@@ -605,7 +1033,7 @@ export function PosClient({
           </div>
         )}
 
-        <div className="mb-3 flex gap-2 overflow-x-auto pb-1 scrollbar-thin">
+        <div className="mb-3 flex shrink-0 gap-2 overflow-x-auto pb-1 scrollbar-thin">
           <Chip active={cat === ""} onClick={() => setCat("")}>All</Chip>
           {categories.map((c) => <Chip key={c.id} active={cat === c.id} onClick={() => setCat(c.id)}>{c.name}</Chip>)}
         </div>
@@ -657,13 +1085,15 @@ export function PosClient({
       </div>
 
       {/* desktop cart */}
-      <div className="hidden lg:block">
+      <div className="hidden min-h-0 lg:flex lg:min-h-0 lg:flex-col lg:overflow-hidden">
         <CartPanel
           lines={lines} subtotal={subtotal} discount={discount} setDiscount={setDiscount} total={total} tax={tax} taxPercent={store.tax_percent}
           belowCost={belowCost} promo={promo}
           customers={allCustomers} customerId={customerId} customerName={customerName} setCustomer={setCustomer} onCreateCustomer={createCustomer}
           setQty={setQty} remove={(id) => setQty(id, 0)} setLineDiscount={setLineDiscount} clearLineDiscount={clearLineDiscount}
           processing={processing} onCharge={openPayment} onHold={holdSale}
+          editing={editing} qtyDraft={qtyDraft} setQtyDraft={setQtyDraft} discDraft={discDraft} setDiscDraft={setDiscDraft}
+          beginEdit={beginEdit} commitQty={commitQty} commitDisc={commitDisc} cancelEdit={focusScan} activeLine={activeLine}
         />
       </div>
 
@@ -690,7 +1120,9 @@ export function PosClient({
               belowCost={belowCost} promo={promo}
               customers={allCustomers} customerId={customerId} customerName={customerName} setCustomer={setCustomer} onCreateCustomer={createCustomer}
               setQty={setQty} remove={(id) => setQty(id, 0)} setLineDiscount={setLineDiscount} clearLineDiscount={clearLineDiscount}
-              processing={processing} onCharge={openPayment} onHold={holdSale} embedded
+              processing={processing} onCharge={openPayment} onHold={holdSale}
+              editing={editing} qtyDraft={qtyDraft} setQtyDraft={setQtyDraft} discDraft={discDraft} setDiscDraft={setDiscDraft}
+              beginEdit={beginEdit} commitQty={commitQty} commitDisc={commitDisc} cancelEdit={focusScan} activeLine={activeLine} embedded
             />
           </div>
         </div>
@@ -763,22 +1195,19 @@ export function PosClient({
               <button onClick={() => setShortcutsOpen(false)} className="rounded-lg p-1.5 text-text-tertiary hover:bg-surface-2"><X className="h-5 w-5" /></button>
             </div>
             <dl className="space-y-2 text-sm">
-              {[
-                ["F2", "Focus product search"],
-                ["F4", "Checkout (charge)"],
-                ["F6", "Print last receipt"],
-                ["Esc", "Clear current sale"],
-                ["↑ ↓ ← →", "Move highlight"],
-                ["Enter", "Add highlighted item"],
-                ["+ / −", "Change its quantity"],
-                ["?", "This help"],
-              ].map(([k, d]) => (
-                <div key={k} className="flex items-center justify-between gap-3">
-                  <span className="text-text-secondary">{d}</span>
-                  <kbd className="rounded-md border border-border bg-surface-2 px-2 py-0.5 font-mono text-xs text-text-primary">{k}</kbd>
+              {SHORTCUT_HELP.map(({ keys, label }) => (
+                <div key={keys} className="flex items-center justify-between gap-3">
+                  <span className="text-text-secondary">{label}</span>
+                  <kbd className="shrink-0 rounded-md border border-border bg-surface-2 px-2 py-0.5 font-mono text-xs text-text-primary">{keys}</kbd>
                 </div>
               ))}
             </dl>
+            <p className="mt-3 border-t border-border pt-2 text-[11px] leading-relaxed text-text-tertiary">
+              F3 and F6 are no longer used: the browser keeps those for Find and for
+              moving between its own panes, so a page cannot reliably claim them.
+              They are now <strong className="text-text-secondary">F8</strong> and{" "}
+              <strong className="text-text-secondary">F9</strong>.
+            </p>
           </div>
         </div>
       )}
@@ -800,6 +1229,7 @@ function CartPanel({
   lines, subtotal, discount, setDiscount, total, tax, taxPercent, belowCost, promo,
   customers, customerId, customerName, setCustomer, onCreateCustomer,
   setQty, remove, setLineDiscount, clearLineDiscount, processing, onCharge, onHold, embedded,
+  editing, qtyDraft, setQtyDraft, discDraft, setDiscDraft, beginEdit, commitQty, commitDisc, cancelEdit, activeLine,
 }: {
   lines: CartEntry[];
   subtotal: number; discount: string; setDiscount: (v: string) => void; total: number;
@@ -812,10 +1242,35 @@ function CartPanel({
   setQty: (id: string, qty: number) => void; remove: (id: string) => void;
   setLineDiscount: (id: string, value: number) => void; clearLineDiscount: (id: string) => void;
   processing: boolean; onCharge: () => void; onHold: () => void; embedded?: boolean;
+  /** Phase B — keyboard qty/discount entry (see PosClient for the flow). */
+  editing: { id: string; field: "qty" | "disc" } | null;
+  qtyDraft: string; setQtyDraft: (v: string) => void;
+  discDraft: string; setDiscDraft: (v: string) => void;
+  beginEdit: (id?: string) => void; commitQty: () => void; commitDisc: () => void; cancelEdit: () => void;
+  activeLine: string | null;
 }) {
+  // Only the ONE line in edit mode renders these inputs, so a single pair of
+  // refs can never target the wrong line however many lines are in the cart.
+  const qtyRef = useRef<HTMLInputElement>(null);
+  const discRef = useRef<HTMLInputElement>(null);
+  const editKey = editing ? `${editing.id}:${editing.field}` : "";
+  useEffect(() => {
+    if (!editing) return;
+    const el = editing.field === "qty" ? qtyRef.current : discRef.current;
+    if (!el || el.offsetParent === null) return; // skip the hidden (desktop) copy on mobile
+    el.focus();
+    el.select();
+  }, [editKey, editing]);
+
+  /** Enter/Tab advance the flow; Escape backs out to the scan box. */
+  const stepKey = (e: React.KeyboardEvent, commit: () => void) => {
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); commit(); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelEdit(); }
+  };
+
   return (
-    <div className={cn("flex flex-col rounded-2xl border border-border bg-surface", embedded ? "max-h-[72vh]" : "h-full")}>
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+    <div className={cn("flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-surface", embedded ? "max-h-[72vh]" : "h-full")}>
+      <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
         <span className="flex items-center gap-2 font-heading font-semibold text-text-primary"><ShoppingCart className="h-4 w-4" /> Cart</span>
         <span className="text-xs text-text-tertiary">{lines.length} line{lines.length !== 1 ? "s" : ""}</span>
       </div>
@@ -830,8 +1285,16 @@ function CartPanel({
           const net = round2(gross - l.discount);
           const hasDisc = l.discount > 0;
           const lineBelowCost = l.p.cost > 0 && net < l.p.cost * l.qty;
+          const isEditing = editing?.id === l.p.variant_id;
           return (
-          <div key={l.p.variant_id} className="border-b border-border/60 px-3 py-2 last:border-0">
+          <div
+            key={l.p.variant_id}
+            onClick={() => { if (!isEditing) beginEdit(l.p.variant_id); }}
+            className={cn(
+              "cursor-pointer border-b border-border/60 px-3 py-2 last:border-0",
+              isEditing ? "bg-brand-50/60 ring-1 ring-inset ring-brand-500" : activeLine === l.p.variant_id ? "bg-surface-2/50" : "hover:bg-surface-2/40",
+            )}
+          >
             <div className="flex items-center gap-2">
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium text-text-primary">{l.p.name}</div>
@@ -846,38 +1309,78 @@ function CartPanel({
                 </div>
               </div>
               <div className="flex items-center gap-1">
-                <button onClick={() => setQty(l.p.variant_id, l.qty - 1)} className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text-primary"><Minus className="h-3.5 w-3.5" /></button>
+                <button onClick={(e) => { e.stopPropagation(); setQty(l.p.variant_id, l.qty - 1); }} className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text-primary"><Minus className="h-3.5 w-3.5" /></button>
                 <span className="tnum w-6 text-center text-sm font-semibold">{l.qty}</span>
-                <button onClick={() => setQty(l.p.variant_id, l.qty + 1)} disabled={l.qty >= l.p.available} className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text-primary disabled:opacity-40"><Plus className="h-3.5 w-3.5" /></button>
+                <button onClick={(e) => { e.stopPropagation(); setQty(l.p.variant_id, l.qty + 1); }} disabled={l.qty >= l.p.available} className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text-primary disabled:opacity-40"><Plus className="h-3.5 w-3.5" /></button>
               </div>
               <div className="tnum w-16 text-right text-sm font-medium text-text-primary">{formatPKR(net)}</div>
-              <button onClick={() => remove(l.p.variant_id)} className="rounded-md p-1 text-text-tertiary hover:text-coral-text"><Trash2 className="h-4 w-4" /></button>
+              <button onClick={(e) => { e.stopPropagation(); remove(l.p.variant_id); }} className="rounded-md p-1 text-text-tertiary hover:text-coral-text"><Trash2 className="h-4 w-4" /></button>
             </div>
-            {/* per-line discount: auto-filled from the product, editable / removable */}
-            <div className="mt-1 flex items-center gap-2 pl-0.5">
-              <span className="text-[11px] text-text-tertiary">Discount</span>
-              <Input
-                type="number"
-                value={l.discount ? String(round2(l.discount)) : ""}
-                onChange={(e) => setLineDiscount(l.p.variant_id, Number(e.target.value) || 0)}
-                placeholder="0"
-                className="h-7 w-20 text-right text-xs"
-              />
-              {hasDisc && (
-                <button onClick={() => clearLineDiscount(l.p.variant_id)} className="text-[11px] font-medium text-text-tertiary hover:text-coral-text">Remove</button>
-              )}
-              {lineBelowCost && (
-                <span className="ml-auto flex items-center gap-1 text-[11px] font-medium text-coral-text" title="This line is below its cost">
-                  <AlertTriangle className="h-3 w-3" /> below cost
+
+            {isEditing ? (
+              /* Phase B — type qty, Enter, type discount, Enter, back to scanning. */
+              <div data-cart-edit className="mt-1.5 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-medium text-text-secondary">Qty</span>
+                  <Input
+                    ref={qtyRef}
+                    data-cart-edit
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    value={qtyDraft}
+                    onChange={(e) => setQtyDraft(e.target.value)}
+                    onKeyDown={(e) => stepKey(e, commitQty)}
+                    className="h-8 w-20 text-right text-sm"
+                  />
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-medium text-text-secondary">Disc &#8360;</span>
+                  <Input
+                    ref={discRef}
+                    data-cart-edit
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    value={discDraft}
+                    onChange={(e) => setDiscDraft(e.target.value)}
+                    onKeyDown={(e) => stepKey(e, commitDisc)}
+                    placeholder="0"
+                    className="h-8 w-20 text-right text-sm"
+                  />
+                </label>
+                <span className="ml-auto text-right text-[10px] leading-tight text-text-tertiary">
+                  {editing?.field === "qty" ? "Enter → discount" : "Enter → done"}
+                  <br />Esc cancels
                 </span>
-              )}
-            </div>
+              </div>
+            ) : (
+              /* per-line discount: auto-filled from the product, editable / removable */
+              <div className="mt-1 flex items-center gap-2 pl-0.5" onClick={(e) => e.stopPropagation()}>
+                <span className="text-[11px] text-text-tertiary">Discount</span>
+                <Input
+                  type="number"
+                  value={l.discount ? String(round2(l.discount)) : ""}
+                  onChange={(e) => setLineDiscount(l.p.variant_id, Number(e.target.value) || 0)}
+                  placeholder="0"
+                  className="h-7 w-20 text-right text-xs"
+                />
+                {hasDisc && (
+                  <button onClick={() => clearLineDiscount(l.p.variant_id)} className="text-[11px] font-medium text-text-tertiary hover:text-coral-text">Remove</button>
+                )}
+                {lineBelowCost && (
+                  <span className="ml-auto flex items-center gap-1 text-[11px] font-medium text-coral-text" title="This line is below its cost">
+                    <AlertTriangle className="h-3 w-3" /> below cost
+                  </span>
+                )}
+              </div>
+            )}
           </div>
           );
         })}
       </div>
 
-      <div className="space-y-3 border-t border-border p-4">
+      <div className="max-h-[60%] shrink-0 space-y-3 overflow-y-auto border-t border-border p-4 scrollbar-thin">
         <CustomerSelect customers={customers} name={customerName} customerId={customerId} onPick={setCustomer} onCreate={onCreateCustomer} />
         <div className="flex items-center justify-between text-sm">
           <span className="text-text-secondary">Subtotal</span><span className="tnum text-text-primary">{formatPKR(subtotal)}</span>
@@ -917,6 +1420,22 @@ function CartPanel({
             {processing ? <Loader2 className="h-5 w-5 animate-spin" /> : <Banknote className="h-5 w-5" />} Charge {formatPKR(total)}
           </Button>
         </div>
+        {/* Which key does what, stated on the screen the cashier is looking at.
+            F9 always means CASH — there is no payment-method selector in this
+            panel to "respect", so an unconditional meaning is the unambiguous
+            one. Anything else is a deliberate trip through the payment sheet. */}
+        {lines.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[11px] leading-tight text-text-tertiary">
+            <span className="flex items-center gap-1">
+              <kbd className="rounded border border-border bg-surface-2 px-1 font-mono text-[10px] text-text-secondary">F9</kbd>
+              <span className="font-medium text-green-text">Cash</span> &amp; print now
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="rounded border border-border bg-surface-2 px-1 font-mono text-[10px] text-text-secondary">F4</kbd>
+              Udhaar / JazzCash / Easypaisa / split
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );

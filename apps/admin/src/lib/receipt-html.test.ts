@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { receiptHtml, RECEIPT_WIDTH_MM } from "./receipt-html";
+import {
+  receiptHtml, RECEIPT_WIDTH_MM, RECEIPT_FALLBACK_HEIGHT_MM, RECEIPT_MAX_HEIGHT_MM,
+  RECEIPT_PROMO_FOOTER, DEFAULT_RECEIPT_DISCLAIMER,
+} from "./receipt-html";
 import type { ReceiptData } from "./receipt";
 
 const base: ReceiptData = {
@@ -16,10 +19,13 @@ const base: ReceiptData = {
 };
 
 describe("receiptHtml (80mm thermal sizing)", () => {
-  it("fixes the page width to the roll and lets height auto-grow (no A4)", () => {
+  it("declares a VALID two-length page size, never `<length> auto` (Phase E)", () => {
     const html = receiptHtml(base);
     expect(RECEIPT_WIDTH_MM).toBe(80);
-    expect(html).toContain(`@page { size: ${RECEIPT_WIDTH_MM}mm auto; margin: 0; }`);
+    // `size: 80mm auto` is invalid CSS — the declaration would be dropped and
+    // the page would fall back to A4, which is what split long bills in two.
+    expect(html).not.toMatch(/@page\s*\{[^}]*size:\s*\d+mm\s+auto/);
+    expect(html).toContain(`@page { size: ${RECEIPT_WIDTH_MM}mm ${RECEIPT_FALLBACK_HEIGHT_MM}mm; margin: 0; }`);
     expect(html).toContain(`width: ${RECEIPT_WIDTH_MM}mm`);
     // No fixed full-page height forcing an A4-length sheet.
     expect(html).not.toMatch(/height:\s*100(vh|%)/);
@@ -82,8 +88,45 @@ describe("receiptHtml (80mm thermal sizing)", () => {
   it("starts at the very top and has no top/bottom padding band", () => {
     const html = receiptHtml(base);
     expect(html).toMatch(/padding:\s*0\s+3\.5mm\s+0;/); // .receipt: no top/bottom pad
-    expect(html).toContain("-webkit-text-stroke"); // bold-everywhere faux weight
     expect(html).toMatch(/print-color-adjust:\s*exact/);
+  });
+
+  it("uses a clean sans-serif font at a light bold weight (no monospace / faux-bold)", () => {
+    const html = receiptHtml(base);
+    expect(html).toMatch(/font-family:\s*Arial[^;]*sans-serif/); // clean sans-serif
+    expect(html).not.toContain("monospace"); // no typewriter/dotted look
+    expect(html).not.toContain("-webkit-text-stroke"); // no heavy faux weight
+    expect(html).not.toContain("text-shadow"); // no faux-bold thickening
+    expect(html).toContain("font-weight: 500"); // light bold body
+  });
+
+  it("re-sizes the page to the measured content height before printing", () => {
+    const html = receiptHtml(base);
+    expect(html).toContain("sizePageToContent");
+    // px -> mm conversion and the clamp must both be present in the print script
+    expect(html).toContain("25.4 / 96");
+    expect(html).toContain(String(RECEIPT_MAX_HEIGHT_MM));
+    expect(html).toContain(`"@page { size: ${RECEIPT_WIDTH_MM}mm " + mm + "mm; margin: 0; }"`);
+  });
+
+  it("forbids any element from introducing its own page break", () => {
+    const html = receiptHtml(base);
+    expect(html).toMatch(/tr,[^{]*\{[^}]*break-inside: avoid/);
+    // The column header must NOT repeat — a receipt is one continuous document.
+    expect(html).toContain("thead { display: table-row-group; }");
+  });
+
+  it("keeps a 200-line bill on a single page declaration", () => {
+    const html = receiptHtml({
+      ...base,
+      items: Array.from({ length: 200 }, (_, i) => ({ name: `Item ${i}`, qty: 1, unit: "Pcs", unit_price: 50, line_total: 50 })),
+    });
+    // exactly one @page rule in the stylesheet (the other occurrence is the
+    // runtime override the print script injects), and it is not `auto`-height
+    const style = /<style>([\s\S]*?)<\/style>/.exec(html)![1];
+    expect(style.match(/@page \{/g)?.length).toBe(1);
+    expect(/@page \{([^}]*)\}/.exec(style)![1]).not.toContain("auto");
+    expect(html).toContain("Item 199");
   });
 
   it("grows with more items (multi-item taller than 1-item)", () => {
@@ -93,5 +136,40 @@ describe("receiptHtml (80mm thermal sizing)", () => {
       items: Array.from({ length: 8 }, (_, i) => ({ name: `Item ${i}`, qty: 2, unit: "Pcs", unit_price: 100, line_total: 200 })),
     }).length;
     expect(many).toBeGreaterThan(one);
+  });
+});
+
+describe("receipt footers (Phase F)", () => {
+  it("prints the default disclaimer when the store has not set one", () => {
+    const html = receiptHtml(base);
+    expect(html).toContain(DEFAULT_RECEIPT_DISCLAIMER);
+    expect(DEFAULT_RECEIPT_DISCLAIMER).toBe("No exchange or claim without bill");
+  });
+
+  it("prints the store's own disclaimer when set, instead of the default", () => {
+    const html = receiptHtml({ ...base, store: { ...base.store, disclaimer: "Goods once sold are not returnable" } });
+    expect(html).toContain("Goods once sold are not returnable");
+    expect(html).not.toContain(DEFAULT_RECEIPT_DISCLAIMER);
+  });
+
+  it("always prints the fixed promotional footer last", () => {
+    const html = receiptHtml(base);
+    for (const line of RECEIPT_PROMO_FOOTER) expect(html).toContain(line);
+    expect(html).toContain("Powered by Usman Ghani");
+    expect(html).toContain("0301-1325560");
+    expect(html).toContain("this.usmanghani@gmail.com");
+    // and it sits after the store's own footer + disclaimer
+    expect(html.indexOf("Powered by Usman Ghani")).toBeGreaterThan(html.indexOf(DEFAULT_RECEIPT_DISCLAIMER));
+    expect(html.indexOf(DEFAULT_RECEIPT_DISCLAIMER)).toBeGreaterThan(html.indexOf("Thank you!"));
+  });
+
+  it("keeps every promo line short enough for 80mm paper", () => {
+    for (const line of RECEIPT_PROMO_FOOTER) expect(line.length).toBeLessThanOrEqual(30);
+  });
+
+  it("escapes a disclaimer containing HTML", () => {
+    const html = receiptHtml({ ...base, store: { ...base.store, disclaimer: '<script>x</script>' } });
+    expect(html).not.toContain("<script>x</script>");
+    expect(html).toContain("&lt;script&gt;");
   });
 });

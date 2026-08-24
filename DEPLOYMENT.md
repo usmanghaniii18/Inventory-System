@@ -11,56 +11,43 @@ not require touching the storefront.
 
 ---
 
-## Deploy `apps/admin` to Cloudflare Pages
+## Deploy `apps/admin` to Railway
 
-`apps/admin` deploys as its **own** Cloudflare Pages project using the official
-Next.js-on-Cloudflare adapter, [`@cloudflare/next-on-pages`]. Every server route in
-the admin app runs on the Cloudflare **Workers (Edge) runtime** — this is enforced by
-`export const runtime = "edge"` on the root layout (`src/app/layout.tsx`, inherited by
-all pages) and on the one route handler (`src/app/api/catalog/route.ts`). No Node-only
-APIs are used (Web Crypto, `fetch`, and the pure-JS `pdf-lib` only), so the whole app
-is Edge-compatible.
+`apps/admin` runs as a **standard Next.js Node server** — `next build` then
+`next start`. There is no edge/Workers runtime and no Cloudflare adapter: routes use
+the default Node.js runtime, and `next start` binds to the `PORT` Railway injects.
 
-### 1. Cloudflare Pages dashboard — Build configuration
+### 1. Create the service
 
-Create a new Pages project → **Connect to Git** → pick this repository, then set:
+Railway → **New Project** → **Deploy from GitHub repo** → pick this repository.
+Railway clones the whole repo (needed so the `@hamza/shared` workspace resolves).
+
+### 2. Service settings
+
+In the service **Settings**:
 
 | Setting | Value |
 |---|---|
+| **Root Directory** | `apps/admin` |
+| **Build Command** | `npm run build` |
+| **Start Command** | `npm run start` |
 | **Production branch** | `on-going-development` (switch to `main` when you go live) |
-| **Framework preset** | Next.js |
-| **Root directory** | `apps/admin` |
-| **Build command** | `npx @cloudflare/next-on-pages` |
-| **Build output directory** | `.vercel/output/static` |
-| **Install command** | leave default (`npm install`) |
 
 Notes:
-- **Root directory = `apps/admin`.** Cloudflare clones the whole repo and runs the
-  build from that folder. `npm install` walks up to the workspace root, so the
-  `@hamza/shared` workspace package resolves automatically.
-- If the build ever can't find `@hamza/shared`, use this monorepo fallback instead:
-  Root directory = repo root, Build command = `npm install && npm run pages:build -w @hamza/admin`,
-  Build output directory = `apps/admin/.vercel/output/static`.
-- Set **`NODE_VERSION` = `20`** (Pages → Settings → Environment variables, or a
-  repo-root `.nvmrc`). `next-on-pages` needs Node 18+.
+- **Root Directory = `apps/admin`.** Railway still has the full repo checked out, so
+  the default `npm install` walks up to the workspace root and the `@hamza/shared`
+  workspace package resolves automatically. (If install ever can't find it, set Root
+  Directory = repo root, Build Command = `npm run build -w @hamza/admin`,
+  Start Command = `npm run start -w @hamza/admin`.)
+- **Do not set `PORT` yourself** — Railway provides it and `next start` reads it
+  automatically (it also binds `0.0.0.0`, so the service is reachable).
+- Use **Node 20+**. Railway picks it up from a repo-root `.nvmrc` or the
+  `NODE_VERSION` service variable.
 
-### 2. Compatibility flags (Pages → Settings → Functions)
+### 3. Environment variables (service → Variables)
 
-Set these for **both** Production and Preview (they mirror `apps/admin/wrangler.toml`):
-
-| Setting | Value |
-|---|---|
-| **Compatibility date** | `2024-12-30` |
-| **Compatibility flags** | `nodejs_compat` |
-
-`nodejs_compat` is required so the Workers runtime can polyfill the Node built-ins
-Next.js and its dependencies expect.
-
-### 3. Environment variables (Pages → Settings → Environment variables)
-
-Set these in the dashboard for **Production** (and **Preview** if you use preview
-deploys). All point at the **existing shared Supabase project** — do not create a new
-one. Values are never committed; only the names below (and in `apps/admin/.env.example`)
+All point at the **existing shared Supabase project** — do not create a new one.
+Values are never committed; only the names below (and in `apps/admin/.env.example`)
 live in git.
 
 **Public — exposed to the browser (`NEXT_PUBLIC_*`):**
@@ -73,7 +60,7 @@ live in git.
 | `NEXT_PUBLIC_APP_NAME` | Optional — display name |
 | `NEXT_PUBLIC_CURRENCY` | Optional — currency label (e.g. `PKR`) |
 
-**Server-only — secret, never prefix with `NEXT_PUBLIC` (mark as "Encrypt" in the dashboard):**
+**Server-only — secret, never prefix with `NEXT_PUBLIC`:**
 
 | Name | Notes |
 |---|---|
@@ -81,43 +68,31 @@ live in git.
 | `ADMIN_OTP_SECRET` | Signs the OTP-verified session cookie (2nd factor). Long random string. **Required** or the admin is unreachable |
 | `RESEND_API_KEY` | Resend key — sends login OTP + password-reset emails |
 | `AUTH_EMAIL_FROM` | Verified Resend sender, e.g. `Hamza Store <noreply@yourdomain.com>` |
-| `WHATSAPP_TOKEN` | Optional — WhatsApp Cloud API token for sending receipt PDFs; send is cleanly stubbed if unset |
-| `WHATSAPP_PHONE_NUMBER_ID` | Optional — WhatsApp Cloud API phone-number id |
 
-**Not needed on Cloudflare** (local-only, used by `node scripts/create-admin.mjs` to seed
-the first admin): `ADMIN_EMAIL`, `ADMIN_PASSWORD`. Run that script locally once, then
-clear them.
+**Local-only** (used by `node scripts/create-admin.mjs` to seed the first admin):
+`ADMIN_EMAIL`, `ADMIN_PASSWORD`. Run that script locally once, then clear them — they
+are not needed on Railway.
 
 ### 4. Custom domain
 
-Pages → **Custom domains** → add the admin domain (e.g. `admin.yourdomain.com`).
-After it resolves, set `NEXT_PUBLIC_APP_URL` to that exact URL and redeploy so the
-password-reset email links are correct.
+Service → **Settings → Networking** → generate a Railway domain or add a custom one
+(e.g. `admin.yourdomain.com`). After it resolves, set `NEXT_PUBLIC_APP_URL` to that
+exact URL and redeploy so the password-reset email links are correct.
 
 ### 5. Scheduled tasks (cron)
 
-`apps/admin` has **no** scheduled task, so **no cron / Cron Triggers configuration is
-needed** for this deploy. (The only cron in the repo is the storefront's
-`/api/cron/release-reservations`, which is out of scope until the storefront is
-deployed separately.)
+`apps/admin` has **no** scheduled task, so nothing extra is needed. (The only cron in
+the repo is the storefront's `/api/cron/release-reservations`, out of scope until the
+storefront is deployed separately.)
 
 ---
 
 ## Local commands
 
-From `apps/admin`:
+From the repo root (the app builds/starts the same way Railway runs it):
 
 ```bash
-npm run pages:build     # produce the Cloudflare build (.vercel/output/static)
-npm run pages:preview   # build, then serve locally with `wrangler pages dev`
-npm run pages:deploy    # build, then `wrangler pages deploy` (direct upload)
+npm run build -w @hamza/admin   # next build
+npm run start -w @hamza/admin   # next start (PORT respected; defaults to 3000)
+npm run dev:admin               # local dev server (next dev)
 ```
-
-> **Windows note:** `@cloudflare/next-on-pages` runs the Vercel build under the hood,
-> which needs symlink support. On Windows that requires **Developer Mode** (Settings →
-> Privacy & security → For developers) **or** running the build under **WSL** — the CLI
-> warns about this. CI and the Cloudflare dashboard build run on Linux, where this is a
-> non-issue. The build otherwise compiles cleanly: all routes are Edge-compatible with
-> no runtime incompatibilities.
-
-[`@cloudflare/next-on-pages`]: https://github.com/cloudflare/next-on-pages

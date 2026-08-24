@@ -4,10 +4,11 @@ import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@hamza/shared/supabase/admin";
 import { createClient } from "@hamza/shared/supabase/server";
 import { getCurrentUser } from "@hamza/shared/auth";
-import { fetchProductsPage, type ProductsQuery, type ProductsPage } from "@/lib/products-query";
+import { fetchProductsPage, fetchAllProducts, type ProductsQuery, type ProductsPage, type ProductRow } from "@/lib/products-query";
 import { generateInternalEan13, generateWeightTemplateEan13 } from "@/lib/barcode";
 import { productInputSchema, variantPatchSchema, importRowsSchema, firstIssue } from "@hamza/shared/validation";
 import type { ParsedProductRow } from "@/lib/csv";
+import { productSlug } from "@/lib/product-slug";
 
 /**
  * Server-side paginated + filtered product search. Powers the Products list's
@@ -19,8 +20,14 @@ export async function searchProducts(params: ProductsQuery): Promise<ProductsPag
   return fetchProductsPage(supabase, params);
 }
 
-function slugify(s: string) {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+/**
+ * Full (optionally filtered) product set for export — pages through the ENTIRE
+ * catalogue server-side so the export never stops at PostgREST's 1000-row cap
+ * (loads up to 15,000+ products with nothing dropped).
+ */
+export async function searchAllProducts(params: Pick<ProductsQuery, "q" | "categoryId" | "categoryIds">): Promise<{ rows: ProductRow[] }> {
+  const supabase = await createClient();
+  return { rows: await fetchAllProducts(supabase, params) };
 }
 
 async function requireManager() {
@@ -118,6 +125,58 @@ export interface ProductInput {
 }
 
 /**
+ * Give every variant of a JUST-CREATED product a scannable internal barcode
+ * when none was typed in.
+ *
+ * Why: `create_product_full` only writes a product_barcodes row when the form
+ * supplied a barcode, so a product added without one had NO barcode at all
+ * until somebody remembered to open Products → Label → "Generate internal
+ * barcode". That easily-missed manual step is why items were turning up at the
+ * till with nothing to scan. New products now leave the Add form scannable.
+ *
+ * The generated value is a GS1 prefix-2 EAN-13 built from a database sequence —
+ * fixed 13 digits, unique, and completely independent of the product's name, so
+ * a one-letter name and a forty-letter name produce identically sized symbols.
+ *
+ * SAFETY: this only ever INSERTS a barcode for a variant that has none. It
+ * never reads, rewrites or regenerates an existing product_barcodes row, so no
+ * sticker already on a shelf can be invalidated by it.
+ */
+async function ensureVariantBarcodes(
+  db: ReturnType<typeof createAdminClient>,
+  productId: string,
+  variableWeight = false,
+): Promise<void> {
+  const { data: variants } = await db
+    .from("product_variants").select("id").eq("product_id", productId);
+  const ids = (variants ?? []).map((v) => v.id as string);
+  if (!ids.length) return;
+
+  const { data: existing } = await db
+    .from("product_barcodes").select("variant_id").in("variant_id", ids);
+  const have = new Set((existing ?? []).map((b) => b.variant_id as string));
+  const missing = ids.filter((id) => !have.has(id));
+  if (!missing.length) return;
+
+  const rows: { product_id: string; variant_id: string; barcode: string; type: string; is_primary: boolean }[] = [];
+  for (const variantId of missing) {
+    const { data: seq, error } = await db.rpc("next_internal_barcode");
+    if (error) return; // sequence unavailable — leave it to the Label dialog
+    const n = Number(seq);
+    rows.push({
+      product_id: productId,
+      variant_id: variantId,
+      barcode: variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n),
+      type: "INTERNAL",
+      is_primary: true,
+    });
+  }
+  // Ignore a unique-violation here: a barcode is a convenience, never a reason
+  // to fail a product the user has already successfully created.
+  await db.from("product_barcodes").insert(rows);
+}
+
+/**
  * Create a product as a parent grouping plus one or more variants.
  * Stock is posted per-variant through the append-only ledger.
  */
@@ -132,7 +191,7 @@ export async function createProduct(input: ProductInput) {
   // barcodes + option links + opening stock (was up to ~35 sequential calls).
   const payload = {
     ...input,
-    slug: `${slugify(input.name)}-${slugify(input.variants[0].sku)}`,
+    slug: productSlug(input.name, input.variants[0].sku),
     created_by: user.id,
   };
   const { data, error } = await db.rpc("create_product_full", { payload });
@@ -143,6 +202,9 @@ export async function createProduct(input: ProductInput) {
       : error.message;
     return { error: msg };
   }
+
+  // Phase D — a new product leaves this form scannable, no second manual step.
+  await ensureVariantBarcodes(db, data as string);
 
   revalidatePath("/admin/products");
   revalidatePath("/admin/stock");
@@ -195,7 +257,11 @@ export async function updateVariant(
   if (!v.success) return { error: firstIssue(v.error) };
   const db = createAdminClient();
 
+  // Cost is NEVER changed through the normal save — it only moves via purchases
+  // (the weighted-average ledger) or the audited correctVariantCost() flow, so a
+  // routine edit can't silently desync avg_cost or skip the owner gate.
   const patch: Record<string, unknown> = { ...rest };
+  delete patch.cost;
   if (sku !== undefined && sku.trim()) patch.sku = sku.trim();
   const { error } = await db.from("product_variants").update(patch).eq("id", id);
   if (error) {
@@ -222,6 +288,84 @@ export async function updateVariant(
 
   revalidateProductSurfaces();
   return { ok: true };
+}
+
+// ---- Correct a wrongly-entered cost price --------------------------------
+// Weighted-average cost normally comes from purchases and isn't editable. This
+// is the controlled exception for fixing a data-entry mistake. See migration
+// 0029: it updates the forward cost numbers (variant.cost + stock_levels.avg_cost)
+// and records an audit row, WITHOUT changing any past sale's snapshotted profit.
+
+export interface VariantCostContext {
+  /** True once the variant has any non-OPENING movement (sales/purchases/etc.) —
+   *  this is "Case B" and the correction becomes owner-only. */
+  hasHistory: boolean;
+  /** Static cost on the variant row (drives inventory valuation). */
+  cost: number;
+  /** Live weighted-average across physical stock (drives future POS COGS). */
+  avgCost: number;
+  onHand: number;
+  lastCorrection: { new_cost: number; reason: string | null; created_at: string } | null;
+}
+
+/** Read the cost context so the UI can show current figures and decide Case A vs B. */
+export async function getVariantCostContext(
+  variantId: string,
+): Promise<{ error: string } | ({ ok: true } & VariantCostContext)> {
+  if (!(await requireManager())) return { error: "Not authorized." };
+  const db = createAdminClient();
+  const [{ data: hist }, { data: v }, { data: av }, { data: last }] = await Promise.all([
+    db.from("stock_moves").select("id").eq("variant_id", variantId).neq("reference_type", "OPENING").limit(1),
+    db.from("product_variants").select("cost").eq("id", variantId).maybeSingle(),
+    db.from("variant_availability").select("avg_cost, on_hand").eq("variant_id", variantId).maybeSingle(),
+    db.from("cost_corrections").select("new_cost, reason, created_at").eq("variant_id", variantId).order("created_at", { ascending: false }).limit(1).maybeSingle(),
+  ]);
+  return {
+    ok: true as const,
+    hasHistory: (hist ?? []).length > 0,
+    cost: Number(v?.cost ?? 0),
+    avgCost: Number(av?.avg_cost ?? 0),
+    onHand: Number(av?.on_hand ?? 0),
+    lastCorrection: last ?? null,
+  };
+}
+
+/**
+ * Correct a variant's cost price.
+ *  - Case A (no sales/purchase history): owner OR manager may fix the initial cost.
+ *  - Case B (history exists): OWNER ONLY, and a reason is required.
+ * Past completed sales keep their original recorded profit (snapshotted COGS) —
+ * only the forward cost (valuation + future COGS) is corrected. Authoritative
+ * history/role checks happen here, not in the client.
+ */
+export async function correctVariantCost(variantId: string, newCost: number, reason: string) {
+  const user = await getCurrentUser();
+  if (!user || (user.role !== "owner" && user.role !== "manager")) return { error: "Not authorized." };
+  if (!Number.isFinite(newCost) || newCost < 0) return { error: "Enter a valid cost (0 or more)." };
+
+  const db = createAdminClient();
+  const { data: hist } = await db
+    .from("stock_moves").select("id").eq("variant_id", variantId).neq("reference_type", "OPENING").limit(1);
+  const hasHistory = (hist ?? []).length > 0;
+
+  if (hasHistory && user.role !== "owner") {
+    return { error: "This product already has sales/purchase history — only the owner can correct its cost." };
+  }
+  if (hasHistory && !reason.trim()) {
+    return { error: "Please add a short reason for the correction." };
+  }
+
+  const { data, error } = await db.rpc("correct_variant_cost", {
+    p_variant_id: variantId,
+    p_new_cost: newCost,
+    p_reason: reason.trim() || null,
+    p_created_by: user.id,
+  });
+  if (error) return { error: error.message };
+
+  revalidateProductSurfaces();
+  revalidatePath("/admin/reports");
+  return { ok: true as const, hadHistory: hasHistory, result: data };
 }
 
 // ---- Bulk CSV import (full products + opening stock) ---------------------
@@ -355,11 +499,14 @@ export async function importProducts(rows: ParsedProductRow[]) {
         opening_qty: r.qty || 0,
         option_values: [],
       }],
-      slug: `${slugify(r.name)}-${slugify(r.sku)}`,
+      slug: productSlug(r.name, r.sku),
       created_by: user.id,
     };
     const { data: productId, error } = await db.rpc("create_product_full", { payload });
     if (error || !productId) continue;
+
+    // Imported rows without a barcode column get one too (same guarantee).
+    await ensureVariantBarcodes(db, productId as string);
 
     // Image(s): one or more URLs separated by "|" (first = cover), mirroring the
     // gallery so a CSV image link displays exactly like an uploaded photo.

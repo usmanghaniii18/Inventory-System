@@ -4,11 +4,8 @@ import { Providers } from "./providers";
 import { themeScript } from "@hamza/shared/theme/ThemeProvider";
 import "./globals.css";
 
-// Cloudflare Pages (@cloudflare/next-on-pages) runs every server route on the
-// Workers Edge runtime. Declaring it on the root layout opts the whole admin app
-// in, so each page/server-action doesn't need its own export. No behaviour change:
-// all server code here is already Edge-safe (Web Crypto, fetch only — no Node APIs).
-export const runtime = "edge";
+// The admin app runs as a standard Next.js Node server (`next start`, e.g. on
+// Railway). Routes use the default Node.js runtime — no edge runtime is forced.
 
 const jakarta = Plus_Jakarta_Sans({
   subsets: ["latin"],

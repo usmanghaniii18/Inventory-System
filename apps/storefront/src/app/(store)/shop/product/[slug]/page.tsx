@@ -7,6 +7,13 @@ import { ProductCard } from "@/components/store/ProductCard";
 import { AddToBag } from "@/components/store/AddToBag";
 import { WishlistButton } from "@/components/store/WishlistButton";
 
+// This page reads via the service client (no cookies()/headers()/searchParams),
+// so Next.js would otherwise treat it as static and cache it indefinitely after
+// the first visit — a POS sale that drops stock to 0 wouldn't be reflected in
+// the "In stock"/availability shown here until the next deploy. Revalidate
+// every 30s so stock/availability never goes stale for more than that.
+export const revalidate = 30;
+
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {
   const { slug } = await params;
   const p = await getProductBySlug(slug);

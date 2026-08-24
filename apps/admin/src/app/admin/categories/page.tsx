@@ -1,22 +1,65 @@
 import type { Metadata } from "next";
 import { createClient } from "@hamza/shared/supabase/server";
+import { fetchAll } from "@/lib/fetch-all";
 import { CategoriesClient, type CategoryNode } from "@/features/categories/CategoriesClient";
+import { getArchivedCounts } from "@/features/categories/archived";
 
 export const metadata: Metadata = { title: "Categories" };
 
 export default async function CategoriesPage() {
   const supabase = await createClient();
-  const [{ data: cats }, { data: prods }] = await Promise.all([
+  const [{ data: cats }, prods, archivedCounts] = await Promise.all([
     supabase.from("categories").select("id, name, parent_id, sort").order("sort").order("name"),
-    supabase.from("products").select("category_id"),
+    // Paginated: a plain `.select("category_id")` silently caps at PostgREST's
+    // 1000-row default, undercounting every category once the catalogue grows
+    // past that (the same truncation bug fetchAll exists to prevent elsewhere).
+    fetchAll<{ category_id: string | null }>((from, to) =>
+      supabase.from("products").select("category_id").eq("active", true).order("id").range(from, to)),
+    // Phase J — how many ARCHIVED products sit under each category.
+    getArchivedCounts(),
   ]);
 
-  const counts = new Map<string, number>();
-  for (const p of (prods ?? []) as { category_id: string | null }[]) {
-    if (p.category_id) counts.set(p.category_id, (counts.get(p.category_id) ?? 0) + 1);
-  }
-  const nodes: CategoryNode[] = ((cats ?? []) as { id: string; name: string; parent_id: string | null }[])
-    .map((c) => ({ id: c.id, name: c.name, parent_id: c.parent_id, product_count: counts.get(c.id) ?? 0 }));
+  const direct = new Map<string, number>();
+  for (const p of prods) if (p.category_id) direct.set(p.category_id, (direct.get(p.category_id) ?? 0) + 1);
 
-  return <CategoriesClient categories={nodes} />;
+  // Roll up: a category's count = its own direct products PLUS every
+  // descendant sub-category's products (recursive, in case nesting ever goes
+  // deeper than one level).
+  const childrenOf = new Map<string, string[]>();
+  for (const c of cats ?? []) if (c.parent_id) childrenOf.set(c.parent_id, [...(childrenOf.get(c.parent_id) ?? []), c.id]);
+  const rollupCache = new Map<string, number>();
+  function rollupCount(id: string): number {
+    const cached = rollupCache.get(id);
+    if (cached !== undefined) return cached;
+    let total = direct.get(id) ?? 0;
+    for (const childId of childrenOf.get(id) ?? []) total += rollupCount(childId);
+    rollupCache.set(id, total);
+    return total;
+  }
+
+  // Archived counts roll up the same way active ones do.
+  const archivedCache = new Map<string, number>();
+  function archivedRollup(id: string): number {
+    const cached = archivedCache.get(id);
+    if (cached !== undefined) return cached;
+    let total = archivedCounts[id] ?? 0;
+    for (const childId of childrenOf.get(id) ?? []) total += archivedRollup(childId);
+    archivedCache.set(id, total);
+    return total;
+  }
+
+  const nodes: CategoryNode[] = ((cats ?? []) as { id: string; name: string; parent_id: string | null }[])
+    .map((c) => ({
+      id: c.id, name: c.name, parent_id: c.parent_id,
+      product_count: rollupCount(c.id),
+      archived_count: archivedCounts[c.id] ?? 0,
+      archived_rollup: archivedRollup(c.id),
+    }));
+
+  return (
+    <CategoriesClient
+      categories={nodes}
+      uncategorisedArchived={archivedCounts["__uncategorised__"] ?? 0}
+    />
+  );
 }

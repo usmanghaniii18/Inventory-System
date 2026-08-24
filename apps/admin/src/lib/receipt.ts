@@ -34,6 +34,11 @@ export interface ReceiptStore {
   logo_url?: string;
   header?: string;
   footer?: string;
+  /**
+   * Store-set disclaimer printed on every receipt (Phase F). Editable from
+   * Settings → Store profile; falls back to DEFAULT_RECEIPT_DISCLAIMER.
+   */
+  disclaimer?: string;
   ntn?: string;
 }
 

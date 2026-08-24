@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Search, Loader2, Wallet, PackageX, Layers, AlertTriangle, Info, X,
   PackagePlus, SlidersHorizontal, ArrowLeftRight, ClipboardCheck, History,
@@ -23,8 +24,10 @@ import {
   stockIn, adjustStock, transferStock, cycleCount, getMovementHistory, type MoveRow,
 } from "./actions";
 import { useScanHandler } from "@/components/scan/ScanProvider";
+import { CategoryMultiSelect, type CategoryOption } from "@/components/CategoryMultiSelect";
 import { parseScan } from "@/lib/barcode";
 import { ensureCatalog, lookupBarcodeLoose } from "@/lib/catalog-cache";
+import { expandCategorySelection } from "@/lib/categories";
 import { beepOk, beepError } from "@/lib/sound";
 
 export interface PhysLocation { code: string; name: string }
@@ -62,14 +65,17 @@ export function StockClient({
   rows, categories, locations,
 }: {
   rows: StockRow[];
-  categories: { id: string; name: string }[];
+  categories: CategoryOption[];
   locations: PhysLocation[];
 }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const sp = useSearchParams();
   const toast = useToast();
   const [q, setQ] = useState("");
-  const [cat, setCat] = useState("");
+  const [catIds, setCatIds] = useState<string[]>([]);
+  // Selecting a main category must also match its sub-categories' products.
+  const expandedCats = useMemo(() => expandCategorySelection(catIds, categories), [catIds, categories]);
   // Honor a ?filter=low_stock deep link from the dashboard "Low Stock → See all".
   const initialFilter = sp.get("filter");
   const [status, setStatus] = useState<StatusFilter>(
@@ -105,7 +111,7 @@ export function StockClient({
   const filtered = useMemo(() => {
     const term = q.trim().toLowerCase();
     return rows.filter((r) => {
-      if (cat && r.category_id !== cat) return false;
+      if (catIds.length && (!r.category_id || !expandedCats.has(r.category_id))) return false;
       if (status !== "all" && rowStatus(r) !== status) return false;
       if (loc && !(r.byLocation.find((l) => l.code === loc)?.on_hand)) return false;
       if (!term) return true;
@@ -116,7 +122,7 @@ export function StockClient({
         (r.barcode ?? "").includes(term)
       );
     });
-  }, [rows, q, cat, status, loc]);
+  }, [rows, q, catIds, expandedCats, status, loc]);
 
   const totalValue = rows.reduce((s, r) => s + r.value, 0);
   const lowCount = rows.filter((r) => rowStatus(r) === "low_stock").length;
@@ -126,7 +132,7 @@ export function StockClient({
     <div className="min-w-0">
       <PageHeader
         title="Stock"
-        subtitle="Live on-hand levels per variant — every change is a recorded movement"
+        subtitle="Current on-hand levels per variant — every change is a recorded movement"
         actions={
           <div className="flex flex-wrap gap-2">
             <ExportMenu
@@ -184,10 +190,7 @@ export function StockClient({
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-tertiary" />
           <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search product, variant, SKU or barcode…" className="pl-9" />
         </div>
-        <Select value={cat} onChange={(e) => setCat(e.target.value)} className="lg:w-52">
-          <option value="">All categories</option>
-          {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </Select>
+        <CategoryMultiSelect categories={categories} selected={catIds} onChange={setCatIds} className="lg:w-52" />
         <Select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)} className="lg:w-40">
           <option value="all">All statuses</option>
           <option value="in_stock">In stock</option>
@@ -256,9 +259,10 @@ export function StockClient({
           type={action.type}
           preselected={action.row}
           rows={rows}
+          categories={categories}
           locations={locations}
           onClose={() => setAction(null)}
-          onDone={(msg) => { setAction(null); toast(msg); router.refresh(); }}
+          onDone={(msg) => { setAction(null); toast(msg); router.refresh(); queryClient.invalidateQueries({ queryKey: ["products"] }); }}
           onError={(m) => toast(m, "error")}
         />
       )}
@@ -271,26 +275,36 @@ export function StockClient({
 /* ---------------- Variant picker (search + scan) ---------------- */
 
 function VariantPicker({
-  rows, value, onChange,
+  rows, categories, value, onChange,
 }: {
   rows: StockRow[];
+  categories: CategoryOption[];
   value: StockRow | null;
   onChange: (r: StockRow) => void;
 }) {
   const [term, setTerm] = useState("");
+  // Phase I — narrow the pickable products by category before searching, using
+  // the same multi-select + main→sub rollup as the Low Stock filter above.
+  const [catIds, setCatIds] = useState<string[]>([]);
+  const expanded = useMemo(() => expandCategorySelection(catIds, categories), [catIds, categories]);
+  const scoped = useMemo(
+    () => (catIds.length ? rows.filter((r) => r.category_id && expanded.has(r.category_id)) : rows),
+    [rows, catIds, expanded],
+  );
   const results = useMemo(() => {
     const t = term.trim().toLowerCase();
-    if (!t) return rows.slice(0, 8);
-    // exact barcode -> auto pick
+    if (!t) return scoped.slice(0, 8);
+    // exact barcode -> auto pick (searched across the WHOLE catalogue, so a scan
+    // still resolves even when a category filter is narrowing the list)
     const exact = rows.find((r) => r.barcode && r.barcode === term.trim());
     if (exact) return [exact];
-    return rows.filter((r) =>
+    return scoped.filter((r) =>
       r.product_name.toLowerCase().includes(t) ||
       r.label.toLowerCase().includes(t) ||
       r.sku.toLowerCase().includes(t) ||
       (r.barcode ?? "").includes(t),
     ).slice(0, 8);
-  }, [rows, term]);
+  }, [rows, scoped, term]);
 
   if (value) {
     return (
@@ -308,6 +322,9 @@ function VariantPicker({
 
   return (
     <div>
+      <div className="mb-2">
+        <CategoryMultiSelect categories={categories} selected={catIds} onChange={setCatIds} placeholder="All categories" />
+      </div>
       <div className="relative">
         <Barcode className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-tertiary" />
         <Input data-scan-input autoFocus value={term} onChange={(e) => setTerm(e.target.value)} placeholder="Scan barcode or search…" className="pl-9" />
@@ -344,11 +361,12 @@ const ACTION_META: Record<ActionType, { title: string; cta: string; desc: string
 };
 
 function ActionDrawer({
-  type, preselected, rows, locations, onClose, onDone, onError,
+  type, preselected, rows, categories, locations, onClose, onDone, onError,
 }: {
   type: ActionType;
   preselected?: StockRow;
   rows: StockRow[];
+  categories: CategoryOption[];
   locations: PhysLocation[];
   onClose: () => void;
   onDone: (msg: string) => void;
@@ -444,7 +462,7 @@ function ActionDrawer({
         <p className="rounded-lg bg-blue-tile/40 px-3 py-2 text-xs text-text-secondary">{meta.desc}</p>
         <div>
           <Label>Product / Variant</Label>
-          <VariantPicker rows={rows} value={variant} onChange={setVariant} />
+          <VariantPicker rows={rows} categories={categories} value={variant} onChange={setVariant} />
         </div>
 
         {type === "in" && (

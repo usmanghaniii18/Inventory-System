@@ -6,7 +6,10 @@
 //                           and producing a stable lookupKey for the catalogue.
 //   2. internal code gen  — GS1 prefix-2 EAN-13 for items with no manufacturer
 //                           barcode, and weight templates for variable-weight.
-//   3. code128Svg()       — dependency-free Code-128B label renderer.
+//   3. barcodeSvg()       — dependency-free label renderer: a real EAN-13
+//                           symbol for a valid 13-digit EAN, Code-128 (with
+//                           automatic B/C subset switching) for anything
+//                           else. Both emit ISO-spec quiet zones.
 //
 // In-store GS1 "prefix 2" convention used here (configurable):
 //   - WEIGHT_PREFIXES ("20","21") => weight/price embedded:
@@ -92,7 +95,7 @@ export function encodeWeightEan13(itemRef: number, weightKg: number, prefix = WE
   return d12 + ean13Check(d12);
 }
 
-// ---- Code-128B (dependency-free) -----------------------------------------
+// ---- Code-128 (dependency-free, auto subset B/C) --------------------------
 // Canonical 107-entry module-width pattern table (index 106 = stop).
 const C128 = [
   "212222","222122","222221","121223","121322","131222","122213","122312","132212","221213",
@@ -107,23 +110,83 @@ const C128 = [
   "214121","412121","111143","111341","131141","114113","114311","411113","411311","113141",
   "114131","311141","411131","211412","211214","211232","2331112",
 ];
+const CODE_C = 99;  // switch to subset C (from B)
+const CODE_B = 100; // switch to subset B (from C)
 const START_B = 104;
+const START_C = 105;
 const STOP = 106;
 
-/** Code-128B module-width sequence (bars/spaces, starting with a bar). */
-export function code128Pattern(text: string): number[] {
-  const vals: number[] = [START_B];
-  let sum = START_B;
-  for (let i = 0; i < text.length; i++) {
-    const v = text.charCodeAt(i) - 32; // Code-128B maps ASCII 32..127 -> 0..95
-    if (v < 0 || v > 95) continue;
-    vals.push(v);
-    sum += v * (i + 1);
+const isDigitAt = (s: string, i: number) => i >= 0 && i < s.length && s[i] >= "0" && s[i] <= "9";
+function digitRun(s: string, i: number) {
+  let n = 0;
+  while (isDigitAt(s, i + n)) n++;
+  return n;
+}
+
+/**
+ * Code-128 symbol values with automatic subset switching.
+ *
+ * Subset C packs TWO digits into one symbol, so a 13-digit code costs 7 symbols
+ * instead of 13. This is why generated labels used to come out roughly twice as
+ * wide as they needed to be: everything was encoded in subset B, one symbol per
+ * character, regardless of the code being pure digits. Switching rules follow
+ * the ISO/IEC 15417 recommendation (start in C on 4+ leading digits; hop into C
+ * for a run of 6+ digits mid-string, or a trailing even run of 4+).
+ */
+export function code128Values(text: string): number[] {
+  const vals: number[] = [];
+  let mode: "B" | "C";
+  let i = 0;
+  const lead = digitRun(text, 0);
+  if (lead >= 4 || (lead === text.length && lead >= 2 && lead % 2 === 0)) {
+    mode = "C";
+    vals.push(START_C);
+  } else {
+    mode = "B";
+    vals.push(START_B);
   }
+
+  while (i < text.length) {
+    if (mode === "C") {
+      if (isDigitAt(text, i) && isDigitAt(text, i + 1)) {
+        vals.push(Number(text.slice(i, i + 2)));
+        i += 2;
+      } else {
+        vals.push(CODE_B);
+        mode = "B";
+      }
+      continue;
+    }
+    const run = digitRun(text, i);
+    const trailing = i + run === text.length;
+    if (run >= 6 || (trailing && run >= 4)) {
+      // Align onto an even boundary before switching (subset C needs pairs).
+      if (run % 2 === 1) {
+        vals.push(text.charCodeAt(i) - 32);
+        i++;
+      }
+      vals.push(CODE_C);
+      mode = "C";
+      continue;
+    }
+    const c = text.charCodeAt(i);
+    i++;
+    if (c < 32 || c > 127) continue; // not representable in subset B — skip it
+    vals.push(c - 32);
+  }
+
+  // Modulo-103 checksum: start value + Σ(value × position), position from 1.
+  let sum = vals[0];
+  for (let k = 1; k < vals.length; k++) sum += vals[k] * k;
   vals.push(sum % 103);
   vals.push(STOP);
+  return vals;
+}
+
+/** Code-128 module-width sequence (bars/spaces, starting with a bar). */
+export function code128Pattern(text: string): number[] {
   const widths: number[] = [];
-  for (const v of vals) for (const ch of C128[v]) widths.push(Number(ch));
+  for (const v of code128Values(text)) for (const ch of C128[v]) widths.push(Number(ch));
   return widths;
 }
 
@@ -133,15 +196,32 @@ export interface Code128Opts {
   margin?: number;
   showText?: boolean;
   color?: string;
+  /**
+   * Unit stamped on the SVG's width/height (the viewBox stays unitless, so the
+   * drawing scales with it). Pass "mm" and a millimetre moduleWidth to get a
+   * symbol whose PRINTED module width is exact — the only way to guarantee the
+   * bars land on the spec'd width rather than on whatever a CSS box squeezes
+   * them to. Default "" keeps the historic px behaviour.
+   */
+  unit?: "" | "mm" | "px";
 }
 
-/** Render a Code-128B barcode as a standalone SVG string. */
+/**
+ * Render a Code-128 barcode as a standalone SVG string.
+ *
+ * Quiet zone: ISO/IEC 15417 requires a clear margin of at least 10X (ten module
+ * widths) on BOTH sides of the symbol. The margin therefore scales with
+ * moduleWidth and is floored at 10X — a fixed 10px margin (5X at the default
+ * 2px module) was below spec and is a classic cause of a scanner refusing the
+ * first sweep across a label.
+ */
 export function code128Svg(text: string, opts: Code128Opts = {}): string {
-  const { height = 56, moduleWidth = 2, margin = 10, showText = true, color = "#111" } = opts;
+  const { height = 56, moduleWidth = 2, showText = true, color = "#111", unit = "" } = opts;
+  const margin = Math.max(opts.margin ?? 0, moduleWidth * 10);
   const widths = code128Pattern(text);
   const totalModules = widths.reduce((a, b) => a + b, 0);
   const w = totalModules * moduleWidth + margin * 2;
-  const textH = showText ? 16 : 0;
+  const textH = showText ? (unit === "mm" ? moduleWidth * 8 : 16) : 0;
   const h = height + textH + margin;
 
   let x = margin;
@@ -153,9 +233,148 @@ export function code128Svg(text: string, opts: Code128Opts = {}): string {
     x += px;
     bar = !bar;
   }
+  const fs = unit === "mm" ? moduleWidth * 6 : 13;
   const label = showText
-    ? `<text x="${w / 2}" y="${margin + height + 13}" font-family="monospace" font-size="13" text-anchor="middle" fill="${color}">${text}</text>`
+    ? `<text x="${w / 2}" y="${margin + height + fs}" font-family="monospace" font-size="${fs}" text-anchor="middle" fill="${color}">${text}</text>`
     : "";
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
-    `<rect width="${w}" height="${h}" fill="#fff"/>${rects}${label}</svg>`;
+  return svgWrap(w, h, unit, rects + label);
+}
+
+/** Wrap rendered bars in an SVG root, optionally sized in physical units. */
+function svgWrap(w: number, h: number, unit: string, body: string): string {
+  const rw = Math.round(w * 1000) / 1000;
+  const rh = Math.round(h * 1000) / 1000;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${rw}${unit}" height="${rh}${unit}" viewBox="0 0 ${rw} ${rh}" shape-rendering="crispEdges">` +
+    `<rect width="${rw}" height="${rh}" fill="#fff"/>${body}</svg>`;
+}
+
+// ---- EAN-13 (dependency-free) --------------------------------------------
+// The internal codes this system generates ARE valid EAN-13s, so the printed
+// label should be a real EAN-13 symbol: 95 modules of symbol vs ~101 in
+// Code-128 subset C and 178 in subset B — the shortest, most universally
+// readable retail symbology, and the one every supermarket scanner is tuned for.
+//
+// Geometry follows ISO/IEC 15420 at the nominal (SC2, 100%) magnification:
+//   module X            0.33 mm
+//   symbol              95X          (3 + 42 + 5 + 42 + 3)
+//   left quiet zone     11X   right quiet zone 7X
+//   bar height          22.85 mm; guard bars run 5X deeper for the digit row.
+const EAN_L = ["0001101","0011001","0010011","0111101","0100011","0110001","0101111","0111011","0110111","0001011"];
+const EAN_G = ["0100111","0110011","0011011","0100001","0011101","0111001","0000101","0010001","0001001","0010111"];
+const EAN_R = ["1110010","1100110","1101100","1000010","1011100","1001110","1010000","1000100","1001000","1110100"];
+/** Which of the six left-hand digits use G (even) parity, per the first digit. */
+const EAN_PARITY = ["000000","001011","001101","001110","010011","011001","011100","010101","010110","011010"];
+
+/** EAN-13 module bitmap (1 = bar) — 95 modules, no quiet zones. */
+export function ean13Bits(code: string): string {
+  const d = code.split("").map(Number);
+  const parity = EAN_PARITY[d[0]];
+  let bits = "101"; // start guard
+  for (let i = 1; i <= 6; i++) bits += parity[i - 1] === "0" ? EAN_L[d[i]] : EAN_G[d[i]];
+  bits += "01010"; // centre guard
+  for (let i = 7; i <= 12; i++) bits += EAN_R[d[i]];
+  bits += "101"; // end guard
+  return bits;
+}
+
+export interface Ean13Opts {
+  /** Module (narrowest bar) width. Nominal (SC2 / 100%) is 0.33mm. */
+  moduleWidth?: number;
+  /** Bar height, excluding the guard-bar extension. Nominal is 22.85mm. */
+  height?: number;
+  showText?: boolean;
+  color?: string;
+  /** See {@link Code128Opts.unit} — pass "mm" for an exact printed size. */
+  unit?: "" | "mm" | "px";
+}
+
+/**
+ * Render a valid 13-digit EAN-13 as an SVG, to spec: 11X left and 7X right
+ * quiet zones, guard bars extended 5X below the data bars, and the leading
+ * digit printed in the left quiet zone (which is also what reserves it).
+ */
+export function ean13Svg(code: string, opts: Ean13Opts = {}): string {
+  const { moduleWidth = 2, height = 60, showText = true, color = "#111", unit = "" } = opts;
+  const X = moduleWidth;
+  const QZ_LEFT = 11 * X;
+  const QZ_RIGHT = 7 * X;
+  const bits = ean13Bits(code);
+  const guardDrop = showText ? 5 * X : 0;
+  const textH = showText ? (unit === "mm" ? X * 7 : Math.max(10, X * 7)) : 0;
+  const padTop = 2 * X;
+  const w = QZ_LEFT + bits.length * X + QZ_RIGHT;
+  const h = padTop + height + guardDrop + (showText ? textH * 0.35 : 0) + (showText ? 4 : 0);
+
+  // Guard-bar module positions (start 0-2, centre 45-49, end 92-94) run deeper.
+  const isGuard = (i: number) => (i >= 0 && i <= 2) || (i >= 45 && i <= 49) || (i >= 92 && i <= 94);
+  let rects = "";
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i] !== "1") continue;
+    const x = QZ_LEFT + i * X;
+    const barH = height + (isGuard(i) ? guardDrop : 0);
+    rects += `<rect x="${x}" y="${padTop}" width="${X}" height="${barH}" fill="${color}"/>`;
+  }
+
+  let text = "";
+  if (showText) {
+    const fs = unit === "mm" ? X * 6 : Math.max(8, X * 6);
+    const baseline = padTop + height + guardDrop - X * 0.5;
+    const mid = (from: number, to: number) => QZ_LEFT + ((from + to) / 2) * X;
+    const t = (x: number, s: string, anchor = "middle") =>
+      `<text x="${x}" y="${baseline}" font-family="Arial, Helvetica, sans-serif" font-size="${fs}" text-anchor="${anchor}" fill="${color}">${s}</text>`;
+    text += t(QZ_LEFT - X * 1.5, code[0], "end");                  // leading digit, in the quiet zone
+    text += t(mid(3, 45), code.slice(1, 7));                        // left group
+    text += t(mid(50, 92), code.slice(7, 13));                      // right group
+  }
+
+  return svgWrap(w, h, unit, rects + text);
+}
+
+/**
+ * Render whatever symbology suits the code: a real EAN-13 symbol for a valid
+ * 13-digit EAN (every internally generated code), Code-128 with automatic
+ * subset switching for anything else (alphanumeric SKUs, supplier codes).
+ * Both paths emit spec quiet zones, so a label prints scannable either way.
+ */
+export function barcodeSvg(code: string, opts: Code128Opts & Ean13Opts = {}): string {
+  return isValidEan13(code) ? ean13Svg(code, opts) : code128Svg(code, opts);
+}
+
+/**
+ * Print geometry for the shelf-label printer.
+ *
+ * A 203 dpi thermal head puts down one dot every 25.4/203 = 0.1251mm. Choosing
+ * a module width that is a WHOLE number of dots is what keeps every bar the
+ * same printed width — a fractional module makes the printer round some bars up
+ * and some down, and an uneven symbol is a classic "scans sometimes" fault.
+ *
+ *   EAN-13   3 dots = 0.375mm  (above the 0.33mm nominal, so >100% magnification)
+ *            symbol 95X + 18X quiet zones = 113X = 42.4mm wide
+ *   Code-128 2 dots = 0.250mm  (comfortably above the 0.19mm practical minimum)
+ *            quiet zone 10X each side, enforced by code128Svg
+ */
+export const LABEL_DPI = 203;
+export const LABEL_DOT_MM = 25.4 / LABEL_DPI;
+export const EAN13_MODULE_MM = LABEL_DOT_MM * 3;
+export const CODE128_MODULE_MM = LABEL_DOT_MM * 2;
+/** Bar height in mm. EAN-13's nominal is 22.85mm; shelf labels run truncated. */
+export const LABEL_BAR_HEIGHT_MM = 14;
+
+/** Millimetre-accurate label symbol, ready to drop into a print stylesheet. */
+export function barcodeLabelSvg(code: string, barHeightMm = LABEL_BAR_HEIGHT_MM): string {
+  return isValidEan13(code)
+    ? ean13Svg(code, { moduleWidth: EAN13_MODULE_MM, height: barHeightMm, unit: "mm" })
+    : code128Svg(code, { moduleWidth: CODE128_MODULE_MM, height: barHeightMm, unit: "mm" });
+}
+
+/** Printed width in mm of {@link barcodeLabelSvg}, quiet zones included. */
+export function labelWidthMm(code: string): number {
+  if (isValidEan13(code)) return (11 + 95 + 7) * EAN13_MODULE_MM;
+  const modules = code128Pattern(code).reduce((a, b) => a + b, 0);
+  return (modules + 20) * CODE128_MODULE_MM;
+}
+
+/** Which symbology {@link barcodeSvg} will use — for label copy / diagnostics. */
+export function symbologyOf(code: string): "EAN-13" | "Code-128" {
+  return isValidEan13(code) ? "EAN-13" : "Code-128";
 }

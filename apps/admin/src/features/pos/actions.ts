@@ -7,6 +7,7 @@ import { checkoutSchema, customerQuickSchema, firstIssue } from "@hamza/shared/v
 import { computeTotals, paymentsSettle, round2 } from "@hamza/shared/pricing";
 import { computePromotions, type PromoLine } from "@hamza/shared/discounts";
 import { loadActivePromotions, recordRedemptions } from "@hamza/shared/promotions";
+import { buildSaleMoves } from "@/lib/stock-moves";
 
 export interface CartLine {
   variant_id: string;
@@ -176,12 +177,13 @@ export async function checkoutSale(input: {
     })),
   );
 
-  const moves = items.map((it, i) => ({
-    product_id: it.product_id, variant_id: it.variant_id, qty: it.qty,
-    from_location_id: main, to_location_id: cust, unit_cost: it.unit_cogs,
-    reference_type: "SALE" as const, reference_id: saleId, source: "SCAN" as const,
-    idempotency_key: `${input.idempotency_key}-${i}`, created_by: user.id,
-  }));
+  // Every line yields exactly one MAIN->CUST move (stock leaves the shop, so the
+  // apply_stock_move trigger decrements on_hand), always fully linked. See
+  // buildSaleMoves for the guarded invariants + its regression tests.
+  const moves = buildSaleMoves(items, {
+    mainLocationId: main, custLocationId: cust, saleId,
+    idempotencyKey: input.idempotency_key, userId: user.id,
+  });
   const { error: mErr } = await db.from("stock_moves").insert(moves);
   if (mErr) {
     // The stock guard (or any move failure) rejected the sale — undo the header
@@ -217,6 +219,7 @@ export async function checkoutSale(input: {
   revalidatePath("/admin/products");
   revalidatePath("/admin/dashboard");
   revalidatePath("/admin/discounts");
+  revalidatePath("/admin/reports");
   return {
     ok: true, sale_id: saleId, receipt_no: sale.receipt_no, subtotal, discount, tax, total, profit,
     payments: input.payments,

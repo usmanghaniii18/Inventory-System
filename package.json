@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present",
+    "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "dev:admin": "npm run dev -w @hamza/admin",
@@ -17,9 +17,14 @@
     "db:migrate": "node scripts/migrate.mjs"
   },
   "devDependencies": {
+    "@next/eslint-plugin-next": "^15.5.23",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.20.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
+    "@typescript-eslint/parser": "^8.67.0",
     "dotenv": "^17.4.2",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
     "pg": "^8.21.0",
     "typescript": "^5.7.2"
   }

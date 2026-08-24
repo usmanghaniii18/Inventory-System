@@ -3,6 +3,7 @@ import { createClient } from "@hamza/shared/supabase/server";
 import { getCurrentUser } from "@hamza/shared/auth";
 import { PosClient, type PosProduct, type StoreSettings } from "@/features/pos/PosClient";
 import { PROMO_SELECT, mapPromotion } from "@hamza/shared/promotions";
+import { selectAll } from "@/lib/fetch-all";
 
 export const metadata: Metadata = { title: "POS Billing" };
 
@@ -25,7 +26,8 @@ export default async function PosPage() {
       .eq("active", true)
       .order("product_name")
       .limit(POS_GRID_LIMIT),
-    supabase.from("catalog_index").select("category_id").eq("active", true),
+    // Paged so the category filter-chip list stays complete past 1000 variants.
+    selectAll((from, to) => supabase.from("catalog_index").select("category_id").eq("active", true).order("variant_id").range(from, to)),
     supabase.from("customers").select("id, name, phone, address").order("name"),
     supabase.from("categories").select("id, name, parent_id"),
     supabase.from("settings").select("store_name, tax_percent, store_info").eq("id", 1).maybeSingle(),
@@ -46,6 +48,7 @@ export default async function PosPage() {
     logo_url: info.logo_url,
     receipt_header: info.receipt_header,
     receipt_footer: info.receipt_footer,
+    receipt_disclaimer: info.receipt_disclaimer,
     tax_percent: Number(settings?.tax_percent ?? 0),
   };
 

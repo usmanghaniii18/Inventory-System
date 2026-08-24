@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { createClient } from "@hamza/shared/supabase/server";
+import { selectAll } from "@/lib/fetch-all";
 import { StockClient, type StockRow, type PhysLocation } from "@/features/stock/StockClient";
 
 export const metadata: Metadata = { title: "Stock" };
@@ -16,15 +17,22 @@ export default async function StockPage() {
     { data: availability }, { data: levels }, { data: locations },
     { data: optionValues }, { data: vov },
   ] = await Promise.all([
-    supabase
+    // Active variants only; archived products (products.active = false) are
+    // inactive — they must not appear in stock, the low-stock tile, or the
+    // low_stock filter the dashboard deep-links to. The product's `active` is
+    // pulled through the embed and re-checked below (a variant can be active
+    // under an archived product).
+    // Paged so >1000 variants / >1000 stock-level rows never truncate.
+    selectAll((from, to) => supabase
       .from("product_variants")
-      .select("id, product_id, sku, reorder_point, is_default, products(name, base_unit, category_id), product_barcodes(barcode, is_primary)"),
-    supabase.from("categories").select("id, name, parent_id"),
-    supabase.from("variant_availability").select("variant_id, on_hand, reserved, available, avg_cost"),
-    supabase.from("stock_levels").select("variant_id, location_id, on_hand"),
+      .select("id, product_id, sku, reorder_point, is_default, products(name, base_unit, category_id, active), product_barcodes(barcode, is_primary)")
+      .eq("active", true).order("id").range(from, to)),
+    supabase.from("categories").select("id, name, parent_id, sort").order("sort").order("name"),
+    selectAll((from, to) => supabase.from("variant_availability").select("variant_id, on_hand, reserved, available, avg_cost").order("variant_id").range(from, to)),
+    selectAll((from, to) => supabase.from("stock_levels").select("variant_id, location_id, on_hand").order("variant_id").order("location_id").range(from, to)),
     supabase.from("locations").select("id, code, name, type").eq("type", "PHYSICAL").order("code"),
-    supabase.from("product_option_values").select("id, value"),
-    supabase.from("variant_option_values").select("variant_id, option_value_id"),
+    selectAll((from, to) => supabase.from("product_option_values").select("id, value").order("id").range(from, to)),
+    selectAll((from, to) => supabase.from("variant_option_values").select("variant_id, option_value_id").order("variant_id").order("option_value_id").range(from, to)),
   ]);
 
   const catName = new Map((categories ?? []).map((c) => [c.id, c.name]));
@@ -51,9 +59,18 @@ export default async function StockPage() {
     byLoc.set(l.variant_id, m);
   }
 
-  const rows: StockRow[] = (variants ?? []).map((v) => {
-    const prod = v.products as { name: string; base_unit: string; category_id: string | null } | { name: string; base_unit: string; category_id: string | null }[] | null;
-    const p = Array.isArray(prod) ? prod[0] ?? null : prod;
+  type Prod = { name: string; base_unit: string; category_id: string | null; active: boolean };
+  const productOf = (v: { products: unknown }) => {
+    const prod = v.products as Prod | Prod[] | null;
+    return Array.isArray(prod) ? prod[0] ?? null : prod;
+  };
+
+  const rows: StockRow[] = (variants ?? [])
+    // Drop archived products (products.active = false) — inactive, so never part
+    // of the active stock view, its low-stock tile, or the low_stock filter.
+    .filter((v) => { const p = productOf(v); return p != null && p.active !== false; })
+    .map((v) => {
+    const p = productOf(v);
     const bcs = (v.product_barcodes ?? []) as { barcode: string; is_primary: boolean }[];
     // primary barcode if one exists, else the first — matches the old map's pick.
     const barcode = bcs.find((b) => b.is_primary)?.barcode ?? bcs[0]?.barcode ?? null;
@@ -82,10 +99,24 @@ export default async function StockPage() {
     };
   }).sort((a, b) => a.product_name.localeCompare(b.product_name) || a.label.localeCompare(b.label));
 
-  const cats = (categories ?? []).filter((c) => rows.some((r) => r.category_id === c.id));
-  const catOptions = cats
-    .map((c) => ({ id: c.id, name: c.parent_id ? `${catName.get(c.parent_id) ?? "?"} › ${c.name}` : c.name }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  // A category is offered in the filter if it (or, for a main category, any of
+  // its sub-categories) actually has products — same rollup as the product
+  // count, so a main category with only sub-categorised products still shows up.
+  const allCats = (categories ?? []) as { id: string; name: string; parent_id: string | null }[];
+  const directCatIds = new Set(rows.map((r) => r.category_id).filter(Boolean) as string[]);
+  const childrenOf = new Map<string, string[]>();
+  for (const c of allCats) if (c.parent_id) childrenOf.set(c.parent_id, [...(childrenOf.get(c.parent_id) ?? []), c.id]);
+  const hasProductsCache = new Map<string, boolean>();
+  const hasProducts = (id: string): boolean => {
+    const cached = hasProductsCache.get(id);
+    if (cached !== undefined) return cached;
+    const result = directCatIds.has(id) || (childrenOf.get(id) ?? []).some(hasProducts);
+    hasProductsCache.set(id, result);
+    return result;
+  };
+  const catOptions = allCats
+    .filter((c) => hasProducts(c.id))
+    .map((c) => ({ id: c.id, name: c.name, parent_id: c.parent_id }));
 
   const locOptions: PhysLocation[] = physLocs.map((l) => ({ code: l.code, name: l.name }));
 

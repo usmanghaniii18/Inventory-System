@@ -3,6 +3,7 @@ import { createClient } from "@hamza/shared/supabase/server";
 import { createAdminClient } from "@hamza/shared/supabase/admin";
 import { getCurrentUser } from "@hamza/shared/auth";
 import { SettingsClient, type SettingsData, type UserRow } from "@/features/settings/SettingsClient";
+import { DEFAULT_RETURN_WINDOW_DAYS } from "@/lib/return-window";
 
 export const metadata: Metadata = { title: "Settings" };
 
@@ -42,12 +43,14 @@ export default async function SettingsPage() {
     ntn: String(info.ntn ?? ""),
     receipt_header: String(info.receipt_header ?? ""),
     receipt_footer: String(info.receipt_footer ?? ""),
+    receipt_disclaimer: String(info.receipt_disclaimer ?? ""),
     logo_url: String(info.logo_url ?? ""),
     low_stock_default: Number(inv.low_stock_default ?? 5),
     barcode_format: String(inv.barcode_format ?? "EAN"),
     default_unit: String(inv.default_unit ?? "pcs"),
     rounding: String(sales.rounding ?? "none"),
     receipt_template: String(sales.receipt_template ?? "standard"),
+    return_window_days: Number(info.return_window_days ?? DEFAULT_RETURN_WINDOW_DAYS),
     allow_discounts: Boolean(sales.allow_discounts ?? true),
     courier, resend_key: courier.resend ?? "", whatsapp_key: courier.whatsapp ?? "",
     from_email: String(info.from_email ?? ""),

@@ -1,8 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Plus, Search, Users, Loader2, Wallet, BookUser } from "lucide-react";
+import {
+  Plus, Search, Users, Loader2, Wallet, BookUser,
+  ChevronDown, ChevronRight, Trash2, Pencil, Check, AlertTriangle,
+} from "lucide-react";
 import { PageHeader } from "@hamza/shared/ui/PageHeader";
 import { Card } from "@hamza/shared/ui/Card";
 import { Button } from "@hamza/shared/ui/Button";
@@ -14,9 +17,12 @@ import { Avatar } from "@hamza/shared/ui/Avatar";
 import { StatusPill } from "@hamza/shared/ui/StatusPill";
 import { useToast } from "@hamza/shared/ui/Toast";
 import { ExportMenu } from "@hamza/shared/ui/ExportMenu";
-import { createClient } from "@hamza/shared/supabase/client";
 import { formatPKR } from "@hamza/shared/utils";
 import { createCustomer, recordPayment } from "./actions";
+import {
+  getCustomerUdhaarHistory, deleteUdhaarEntry, renameCustomer,
+  clearCustomerUdhaar, deleteCustomer, type UdhaarHistory,
+} from "./udhaar";
 
 export interface CustomerRow {
   id: string;
@@ -88,7 +94,7 @@ export function CustomersClient({ rows }: { rows: CustomerRow[] }) {
     <div>
       <PageHeader
         title="Customers"
-        subtitle={`${rows.length} customers · udhaar tracking`}
+        subtitle={`${rows.length} customers · full udhaar history per customer`}
         actions={
           <div className="flex gap-2">
             <ExportMenu
@@ -166,30 +172,42 @@ function AddCustomerDrawer({ open, onClose, onSaved, onError }: {
   );
 }
 
-interface LedgerEntry { id: string; type: string; amount: number; reference: string | null; balance_after: number; created_at: string; }
-
 function LedgerDrawer({ customer, onClose, onPaid, onError }: {
   customer: CustomerRow | null; onClose: () => void; onPaid: () => void; onError: (m: string) => void;
 }) {
-  const [entries, setEntries] = useState<LedgerEntry[]>([]);
+  const [history, setHistory] = useState<UdhaarHistory | null>(null);
   const [loading, setLoading] = useState(false);
   const [amount, setAmount] = useState("");
   const [saving, setSaving] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [confirm, setConfirm] = useState<null | { mode: "clear" | "delete" }>(null);
+  const [confirmText, setConfirmText] = useState("");
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!customer) return;
     setLoading(true);
-    const sb = createClient();
-    sb.from("customer_ledger")
-      .select("id, type, amount, reference, balance_after, created_at")
-      .eq("customer_id", customer.id)
-      .order("created_at", { ascending: false })
-      .limit(50)
-      .then(({ data }) => {
-        setEntries((data ?? []).map((e) => ({ ...e, amount: Number(e.amount), balance_after: Number(e.balance_after) })) as LedgerEntry[]);
-        setLoading(false);
-      });
-  }, [customer]);
+    const res = await getCustomerUdhaarHistory(customer.id);
+    setLoading(false);
+    if ("error" in res) { onError(res.error); return; }
+    setHistory(res);
+  }, [customer, onError]);
+
+  useEffect(() => {
+    setHistory(null); setOpen(new Set()); setEditingName(false); setConfirm(null); setConfirmText("");
+    if (customer) { setNameDraft(customer.name); void load(); }
+  }, [customer, load]);
+
+  if (!customer) return null;
+
+  const balance = history?.customer.credit_balance ?? customer.credit_balance;
+  const entries = history?.entries ?? [];
+  const charges = entries.filter((e) => e.kind === "CHARGE");
+
+  const toggle = (id: string) =>
+    setOpen((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   async function pay(e: React.FormEvent) {
     e.preventDefault();
@@ -198,54 +216,216 @@ function LedgerDrawer({ customer, onClose, onPaid, onError }: {
     const res = await recordPayment({ customer_id: customer.id, amount: Number(amount) });
     setSaving(false);
     if (res?.error) { onError(res.error); return; }
-    setAmount(""); onClose(); onPaid();
+    setAmount("");
+    await load();
+    onPaid();
+  }
+
+  async function removeEntry(id: string) {
+    setBusyId(id);
+    const res = await deleteUdhaarEntry(id);
+    setBusyId(null);
+    if ("error" in res) { onError(res.error); return; }
+    await load();
+    onPaid();
+  }
+
+  async function saveName() {
+    if (!customer) return;
+    const res = await renameCustomer(customer.id, nameDraft);
+    if ("error" in res) { onError(res.error); return; }
+    setEditingName(false);
+    await load();
+    onPaid();
+  }
+
+  async function runConfirm() {
+    if (!customer || !confirm) return;
+    setSaving(true);
+    const res = confirm.mode === "clear"
+      ? await clearCustomerUdhaar(customer.id, confirmText)
+      : await deleteCustomer(customer.id, confirmText);
+    setSaving(false);
+    if ("error" in res) { onError(res.error); return; }
+    setConfirm(null); setConfirmText("");
+    onPaid();
+    onClose();
   }
 
   return (
-    <Drawer open={!!customer} onClose={onClose} width="max-w-lg"
-      title={customer ? `Khata — ${customer.name}` : "Khata"}>
-      {customer && (
-        <div className="space-y-5">
-          <div className="rounded-xl border border-border bg-surface-2 p-4">
-            <div className="text-xs text-text-tertiary">Current balance (owes us)</div>
-            <div className={`tnum font-heading text-2xl font-bold ${customer.credit_balance > 0 ? "text-coral-text" : "text-text-primary"}`}>
-              {formatPKR(customer.credit_balance)}
-            </div>
+    <Drawer open={!!customer} onClose={onClose} width="max-w-2xl" title={`Khata — ${history?.customer.name ?? customer.name}`}>
+      <div className="space-y-5">
+        {/* balance + record repayment */}
+        <div className="rounded-xl border border-border bg-surface-2 p-4">
+          <div className="text-xs text-text-tertiary">Current balance (owes us)</div>
+          <div className={`tnum font-heading text-2xl font-bold ${balance > 0 ? "text-coral-text" : "text-text-primary"}`}>
+            {formatPKR(balance)}
           </div>
+          <div className="mt-1 text-xs text-text-tertiary">
+            {charges.length} credit purchase{charges.length !== 1 ? "s" : ""} · {entries.length - charges.length} repayment{entries.length - charges.length !== 1 ? "s" : ""}
+          </div>
+        </div>
 
-          <form onSubmit={pay} className="flex items-end gap-2">
-            <div className="flex-1">
-              <Label>Record repayment (₨)</Label>
-              <Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" />
-            </div>
-            <Button type="submit" disabled={saving || !amount}>{saving && <Loader2 className="h-4 w-4 animate-spin" />} Receive</Button>
-          </form>
-
-          <div>
-            <h4 className="mb-2 text-sm font-semibold text-text-primary">History</h4>
-            {loading ? (
-              <p className="text-sm text-text-tertiary">Loading…</p>
-            ) : entries.length === 0 ? (
-              <p className="text-sm text-text-tertiary">No transactions yet.</p>
+        {/* rename */}
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <Label>Customer name</Label>
+            {editingName ? (
+              <Input value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} autoFocus
+                onKeyDown={(e) => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setEditingName(false); }} />
             ) : (
-              <div className="space-y-1.5">
-                {entries.map((e) => (
-                  <div key={e.id} className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-sm">
-                    <div>
-                      <StatusPill tone={e.type === "PAYMENT" ? "green" : "amber"}>{e.type}</StatusPill>
-                      <span className="ml-2 text-xs text-text-tertiary">{new Date(e.created_at).toLocaleDateString()}</span>
-                    </div>
-                    <div className="text-right">
-                      <div className="tnum font-medium text-text-primary">{formatPKR(e.amount)}</div>
-                      <div className="text-[11px] text-text-tertiary">bal {formatPKR(e.balance_after)}</div>
-                    </div>
-                  </div>
-                ))}
+              <div className="flex h-10 items-center rounded-lg border border-border bg-surface px-3 text-sm text-text-primary">
+                {history?.customer.name ?? customer.name}
               </div>
             )}
           </div>
+          {editingName ? (
+            <>
+              <Button size="sm" onClick={saveName}><Check className="h-4 w-4" /> Save</Button>
+              <Button size="sm" variant="secondary" onClick={() => { setEditingName(false); setNameDraft(history?.customer.name ?? customer.name); }}>Cancel</Button>
+            </>
+          ) : (
+            <Button size="sm" variant="secondary" onClick={() => setEditingName(true)}><Pencil className="h-4 w-4" /> Rename</Button>
+          )}
         </div>
-      )}
+
+        <form onSubmit={pay} className="flex items-end gap-2">
+          <div className="flex-1">
+            <Label>Record repayment (₨)</Label>
+            <Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" />
+          </div>
+          <Button type="submit" disabled={saving || !amount}>{saving && <Loader2 className="h-4 w-4 animate-spin" />} Receive</Button>
+        </form>
+
+        {/* dated itemised history */}
+        <div>
+          <h4 className="mb-2 text-sm font-semibold text-text-primary">History</h4>
+          {loading ? (
+            <p className="text-sm text-text-tertiary">Loading…</p>
+          ) : entries.length === 0 ? (
+            <p className="text-sm text-text-tertiary">No transactions yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {entries.map((e) => {
+                const id = e.ledger_id ?? `sale:${e.sale_id}`;
+                const isOpen = open.has(id);
+                const isCharge = e.kind === "CHARGE";
+                return (
+                  <div key={id} className="overflow-hidden rounded-xl border border-border">
+                    <div className="flex items-center gap-2 px-3 py-2">
+                      <button
+                        type="button"
+                        onClick={() => isCharge && e.items.length > 0 && toggle(id)}
+                        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                        disabled={!isCharge || e.items.length === 0}
+                      >
+                        {isCharge && e.items.length > 0 && (
+                          isOpen ? <ChevronDown className="h-4 w-4 shrink-0 text-text-tertiary" /> : <ChevronRight className="h-4 w-4 shrink-0 text-text-tertiary" />
+                        )}
+                        <StatusPill tone={isCharge ? "amber" : "green"}>{isCharge ? "CREDIT" : "PAID"}</StatusPill>
+                        <div className="min-w-0">
+                          <div className="truncate text-sm text-text-primary">
+                            {new Date(e.date).toLocaleString("en-PK", { dateStyle: "medium", timeStyle: "short" })}
+                          </div>
+                          <div className="truncate text-[11px] text-text-tertiary">
+                            {e.receipt_no ? `${e.receipt_no}` : e.reference ?? "—"}
+                            {isCharge && e.items.length > 0 ? ` · ${e.items.length} item${e.items.length !== 1 ? "s" : ""}` : ""}
+                            {e.orphan ? " · not on ledger" : ""}
+                          </div>
+                        </div>
+                      </button>
+                      <div className="text-right">
+                        <div className={`tnum text-sm font-semibold ${isCharge ? "text-coral-text" : "text-green-text"}`}>
+                          {isCharge ? "+" : "−"}{formatPKR(e.amount)}
+                        </div>
+                        {!e.orphan && <div className="text-[11px] text-text-tertiary">bal {formatPKR(e.balance_after)}</div>}
+                      </div>
+                      {e.ledger_id && (
+                        <button
+                          type="button"
+                          title={isCharge ? "Remove this credit from the khata (the sale itself is kept)" : "Undo this repayment"}
+                          onClick={() => removeEntry(e.ledger_id!)}
+                          disabled={busyId === e.ledger_id}
+                          className="rounded-md p-1.5 text-text-tertiary hover:bg-coral-tile hover:text-coral-text disabled:opacity-40"
+                        >
+                          {busyId === e.ledger_id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                        </button>
+                      )}
+                    </div>
+
+                    {isOpen && e.items.length > 0 && (
+                      <div className="border-t border-border bg-surface-2/40 px-3 py-2">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-text-tertiary">
+                              <th className="py-1 text-left font-medium">Product</th>
+                              <th className="py-1 text-right font-medium">Qty</th>
+                              <th className="py-1 text-right font-medium">Price</th>
+                              <th className="py-1 text-right font-medium">Disc</th>
+                              <th className="py-1 text-right font-medium">Total</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {e.items.map((it, i) => (
+                              <tr key={i} className="border-t border-border/50">
+                                <td className="py-1 pr-2 text-text-primary">{it.name}{it.label ? ` (${it.label})` : ""}</td>
+                                <td className="py-1 text-right tnum">{it.qty}{it.unit ? ` ${it.unit}` : ""}</td>
+                                <td className="py-1 text-right tnum">{formatPKR(it.unit_price)}</td>
+                                <td className="py-1 text-right tnum">{it.discount > 0 ? `−${formatPKR(it.discount)}` : "—"}</td>
+                                <td className="py-1 text-right tnum font-medium text-text-primary">{formatPKR(it.line_total)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <div className="mt-1.5 flex justify-end gap-4 border-t border-border pt-1.5 text-xs">
+                          <span className="text-text-tertiary">Subtotal <span className="tnum text-text-primary">{formatPKR(e.bill_subtotal)}</span></span>
+                          {e.bill_discount > 0 && <span className="text-text-tertiary">Bill discount <span className="tnum text-text-primary">−{formatPKR(e.bill_discount)}</span></span>}
+                          <span className="font-semibold text-text-primary">Invoice total <span className="tnum">{formatPKR(e.bill_total)}</span></span>
+                        </div>
+                        {Math.abs(e.bill_total - e.amount) > 0.5 && (
+                          <p className="mt-1 text-[11px] text-text-tertiary">
+                            {formatPKR(e.amount)} of this bill went on the khata; the rest was paid at the till.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* destructive actions */}
+        <div className="rounded-xl border border-coral-icon/30 bg-coral-tile/30 p-3">
+          <div className="mb-2 flex items-center gap-1.5 text-sm font-medium text-coral-text">
+            <AlertTriangle className="h-4 w-4" /> Danger zone
+          </div>
+          {confirm ? (
+            <div className="space-y-2">
+              <p className="text-xs text-text-secondary">
+                {confirm.mode === "clear"
+                  ? "This deletes EVERY khata entry for this customer and resets their balance to zero. Their sales, stock and reports are not affected. This cannot be undone."
+                  : "This permanently deletes the customer record. Only possible if they have no sales history."}
+              </p>
+              <Label>Type “{history?.customer.name ?? customer.name}” to confirm</Label>
+              <Input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder={history?.customer.name ?? customer.name} />
+              <div className="flex gap-2">
+                <Button size="sm" variant="danger" onClick={runConfirm} disabled={saving || !confirmText.trim()}>
+                  {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {confirm.mode === "clear" ? "Clear khata" : "Delete customer"}
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => { setConfirm(null); setConfirmText(""); }}>Cancel</Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" onClick={() => setConfirm({ mode: "clear" })}>Clear udhaar record…</Button>
+              <Button size="sm" variant="secondary" onClick={() => setConfirm({ mode: "delete" })}>Delete customer…</Button>
+            </div>
+          )}
+        </div>
+      </div>
     </Drawer>
   );
 }

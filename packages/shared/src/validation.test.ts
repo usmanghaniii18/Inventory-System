@@ -25,6 +25,12 @@ describe("checkoutSchema", () => {
   it("rejects a bad id", () => {
     expect(checkoutSchema.safeParse({ ...valid, lines: [{ ...valid.lines[0], variant_id: "nope" }] }).success).toBe(false);
   });
+  it("REGRESSION: a sale line can never be unlinked (both product_id and variant_id required)", () => {
+    const noProduct = { qty: 1, unit_price: 100, variant_id: ID };
+    const noVariant = { qty: 1, unit_price: 100, product_id: ID };
+    expect(checkoutSchema.safeParse({ ...valid, lines: [noProduct] }).success).toBe(false);
+    expect(checkoutSchema.safeParse({ ...valid, lines: [noVariant] }).success).toBe(false);
+  });
 });
 
 describe("returnSchema", () => {

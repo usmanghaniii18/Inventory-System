@@ -5,7 +5,8 @@
   "description": "Shared code for the Hamza Store monorepo: supabase clients, auth, discounts, pricing, validation, utils, log, dates, notifications, promotions, UI components and theme. Consumed as source (transpiled by each app).",
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "lint": "eslint src"
   },
   "exports": {
     ".": "./src/index.ts",
