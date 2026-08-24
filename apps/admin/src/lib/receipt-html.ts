@@ -6,16 +6,57 @@
 //
 // Why HTML and not a PDF for printing: a PDF page can't be resized by CSS, so
 // the browser prints it onto the printer's default paper (A4) and ejects a full
-// blank sheet on a roll. An HTML document with `@page { size: 80mm auto }` tells
-// the browser the page IS 80mm wide and only as tall as the content.
+// blank sheet on a roll. An HTML document can declare the page size itself.
+//
+// PHASE E — why long bills used to print as TWO pieces
+// ---------------------------------------------------
+// This file used to declare `@page { size: 80mm auto; margin: 0 }`. That is
+// INVALID CSS. The `size` property (CSS Paged Media 3) accepts
+//     <length>{1,2} | auto | [ <page-size> || [portrait|landscape] ]
+// — one or two lengths, or the bare keyword `auto`. It does NOT accept a length
+// followed by `auto`. So the whole declaration was dropped and the page silently
+// fell back to the printer's default paper (A4). Short receipts fitted on that
+// one A4 page and looked fine; as soon as a bill grew past ~297mm of content it
+// paginated, and the tail printed as a separate second piece — exactly the
+// reported fault, and exactly why it only showed up on bills with many items.
+//
+// The fix: emit a VALID two-length page size whose height is the receipt's own
+// measured content height. printReceiptHtml() measures the rendered slip after
+// load (so the logo image is included) and rewrites @page to
+// `size: 80mm <content>mm` before printing — one page, exactly as long as the
+// bill, no split and no trailing blank paper.
 import { type ReceiptData, receiptItemName } from "./receipt";
 import { amountToWords } from "./number-to-words";
 
 // Thermal roll width. Default 80mm (printable ≈ 72mm). Switch to 58 for a 58mm
 // roll later without touching anything else — page + container both read this.
 export const RECEIPT_WIDTH_MM = 80;
+// Fallback page height used before the content is measured (and if measuring
+// ever fails). Deliberately generous: too tall only wastes a little paper on a
+// roll, whereas too short would reintroduce the split this phase fixes.
+export const RECEIPT_FALLBACK_HEIGHT_MM = 600;
+// Printer drivers refuse a page beyond a few metres. A bill long enough to hit
+// this is far past any real counter sale, but clamping keeps the job printable
+// instead of failing outright.
+export const RECEIPT_MAX_HEIGHT_MM = 3000;
 // Side padding so ink stays off the edge; content width ≈ width − 2×padding.
 const SIDE_PAD_MM = 3.5;
+
+/**
+ * PHASE F — fixed promotional footer, printed at the very end of every receipt.
+ * Not editable from the admin portal (unlike the store's own disclaimer and
+ * footer lines, which are settings). Split across three short centred lines
+ * because 80mm thermal paper only fits roughly 40 characters at this size —
+ * the wording itself is unchanged, just wrapped so nothing is clipped.
+ */
+export const RECEIPT_PROMO_FOOTER = [
+  "Powered by Usman Ghani",
+  "WhatsApp: 0301-1325560",
+  "this.usmanghani@gmail.com",
+];
+
+/** Default disclaimer if the store admin has not set one. */
+export const DEFAULT_RECEIPT_DISCLAIMER = "No exchange or claim without bill";
 
 const PKR = (n: number) => "Rs " + Math.round(n).toLocaleString("en-PK");
 const NUM = (n: number) => Math.round(n).toLocaleString("en-PK");
@@ -32,7 +73,30 @@ const esc = (s: unknown) =>
  * Print action's pop-up window. Pass `false` to render the very same invoice as
  * a passive preview (e.g. inside an <iframe srcDoc>) without triggering print.
  */
+/**
+ * Is there enough here to actually print?
+ *
+ * Every print entry point (F9, Ctrl+P, the Receipt dialog's Print button)
+ * checks this BEFORE opening a window, so a missing or half-built receipt
+ * produces a small message instead of a TypeError deep inside the renderer —
+ * which, thrown during an event handler, took out the whole POS screen behind
+ * the route error boundary.
+ */
+export function isPrintableReceipt(d: ReceiptData | null | undefined): d is ReceiptData {
+  return !!d && Array.isArray(d.items) && d.items.length > 0;
+}
+
 export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: boolean } = {}): string {
+  // Defensive normalisation. The renderer is reached from the live POS, from a
+  // reprint of a historical sale and from the offline queue, so it must not
+  // assume every optional collection survived the round trip: `.map` on an
+  // undefined items array is an unrecoverable throw, whereas an empty section
+  // is merely an ugly receipt.
+  const items = Array.isArray(d.items) ? d.items : [];
+  const payments = Array.isArray(d.payments) ? d.payments : [];
+  const store = d.store ?? ({ name: "" } as ReceiptData["store"]);
+  d = { ...d, items, payments, store };
+
   const rows = d.items
     .map((it, i) => {
       const name = esc(receiptItemName(it));
@@ -82,8 +146,11 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
 <meta charset="utf-8" />
 <title>Invoice ${esc(d.receipt_no)}</title>
 <style>
-  /* Fix the printed page to the roll width; height follows the content. */
-  @page { size: ${RECEIPT_WIDTH_MM}mm auto; margin: 0; }
+  /* A VALID two-length page size (see the Phase E note at the top of this
+     file). The height here is only the pre-measurement fallback — the print
+     script replaces it with the receipt's exact content height, so one bill
+     always prints as ONE continuous slip however many lines it has. */
+  @page { size: ${RECEIPT_WIDTH_MM}mm ${RECEIPT_FALLBACK_HEIGHT_MM}mm; margin: 0; }
   /* Pure black ink everywhere (dark + legible on thermal) — but plain, no faux
      bolding: a clean sans-serif at a light bold weight, not a heavy/hashed look. */
   * { box-sizing: border-box; color: #000; }
@@ -114,6 +181,12 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
     font-weight: 500;
     -webkit-print-color-adjust: exact; print-color-adjust: exact;
   }
+  /* Nothing in the slip may introduce a page break of its own. */
+  .receipt, table, tbody, .totals { page-break-inside: auto; break-inside: auto; }
+  /* A row may not be sliced in half across a break. */
+  tr, .row, .ln, .words, .footer { page-break-inside: avoid; break-inside: avoid; }
+  /* Do NOT repeat the column header — a receipt is one continuous document. */
+  thead { display: table-row-group; }
   .center { text-align: center; }
   .r { text-align: right; }
   .c { text-align: center; }
@@ -131,6 +204,10 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
   .total { font-weight: 600; font-size: 12pt; margin-top: 1.5mm; }
   .words { font-size: 8pt; margin-top: 0.5mm; }
   .footer { font-size: 8pt; margin-top: 2mm; }
+  .disclaimer { font-size: 8pt; font-weight: 600; margin-top: 2mm; }
+  .promo { font-size: 7pt; margin-top: 2mm; padding-top: 1mm; border-top: 0.4pt solid #000; line-height: 1.3; }
+  /* Bottom breathing room so the tear-off never clips the last line. */
+  .tail { height: 4mm; }
 </style>
 </head>
 <body>
@@ -163,11 +240,30 @@ export function receiptHtml(d: ReceiptData, { autoPrint = true }: { autoPrint?: 
     <div class="words">${esc(amountToWords(netTotal))}</div>
     ${payRow}
     ${d.store.footer ? `<div class="center footer">${esc(d.store.footer)}</div>` : ""}
+    <div class="center disclaimer">${esc(d.store.disclaimer || DEFAULT_RECEIPT_DISCLAIMER)}</div>
+    <div class="center promo">${RECEIPT_PROMO_FOOTER.map((l) => esc(l)).join("<br/>")}</div>
+    <div class="tail"></div>
   </div>
   ${autoPrint ? `<script>
-    // Print as soon as content (incl. the logo image) has loaded, then close.
+    // Size the PAGE to the receipt's own height, then print. Runs on 'load' so
+    // the logo image is already laid out and the measurement includes it.
+    // Without this the page keeps the fallback height and a long bill would
+    // paginate — the Phase E split. One measured page = one continuous slip.
+    function sizePageToContent() {
+      try {
+        var el = document.querySelector(".receipt");
+        if (!el) return;
+        var px = Math.max(el.getBoundingClientRect().height, el.scrollHeight);
+        var mm = px * 25.4 / 96; // CSS px are 1/96in by definition
+        mm = Math.min(Math.ceil(mm) + 2, ${RECEIPT_MAX_HEIGHT_MM});
+        var st = document.createElement("style");
+        st.textContent = "@page { size: ${RECEIPT_WIDTH_MM}mm " + mm + "mm; margin: 0; }";
+        document.head.appendChild(st);
+      } catch (e) { /* keep the fallback height */ }
+    }
     window.addEventListener("load", function () {
-      setTimeout(function () { window.focus(); window.print(); }, 50);
+      sizePageToContent();
+      setTimeout(function () { window.focus(); window.print(); }, 60);
     });
     window.addEventListener("afterprint", function () { window.close(); });
   </script>` : ""}

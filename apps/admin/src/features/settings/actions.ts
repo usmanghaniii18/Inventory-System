@@ -23,7 +23,7 @@ async function mergeJson(db: ReturnType<typeof createAdminClient>, column: "stor
 export async function updateStoreProfile(input: {
   store_name: string; currency: string; tax_percent: number;
   address?: string; phone?: string; ntn?: string;
-  receipt_header?: string; receipt_footer?: string; logo_url?: string;
+  receipt_header?: string; receipt_footer?: string; receipt_disclaimer?: string; logo_url?: string;
 }) {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
   const db = createAdminClient();
@@ -33,7 +33,10 @@ export async function updateStoreProfile(input: {
   if (error) return { error: error.message };
   await mergeJson(db, "store_info", {
     address: input.address ?? "", phone: input.phone ?? "", ntn: input.ntn ?? "",
-    receipt_header: input.receipt_header ?? "", receipt_footer: input.receipt_footer ?? "", logo_url: input.logo_url ?? "",
+    receipt_header: input.receipt_header ?? "", receipt_footer: input.receipt_footer ?? "",
+    // Phase F — blank means "use the built-in default" at render time, so the
+    // admin can clear the field without ending up with no disclaimer at all.
+    receipt_disclaimer: input.receipt_disclaimer ?? "", logo_url: input.logo_url ?? "",
   });
   // The store logo / name / address live in the SHARED admin layout (sidebar +
   // header, on every page) and are read fresh into POS receipts. Revalidating
@@ -111,14 +114,21 @@ export async function updateInventorySettings(input: {
 /* ---------------- Sales settings ---------------- */
 export async function updateSalesSettings(input: {
   tax_percent: number; rounding: string; receipt_template: string; allow_discounts: boolean;
+  /** Phase H — days after a sale that a return is still accepted (0 = no limit). */
+  return_window_days?: number;
 }) {
   if (!(await requireOwner())) return { error: "Only the owner can change settings." };
   const db = createAdminClient();
   await db.from("settings").update({ tax_percent: input.tax_percent }).eq("id", 1);
   await mergeJson(db, "store_info", {
     sales: { rounding: input.rounding, receipt_template: input.receipt_template, allow_discounts: input.allow_discounts },
+    // Kept at the TOP level of store_info because that is where the returns
+    // flow already reads it from — moving it under `sales` would silently
+    // orphan any value a store has already saved.
+    ...(input.return_window_days !== undefined ? { return_window_days: input.return_window_days } : {}),
   });
   revalidatePath("/admin/settings");
+  revalidatePath("/admin/pos");
   return { ok: true };
 }
 

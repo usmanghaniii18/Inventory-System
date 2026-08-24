@@ -27,6 +27,8 @@ import { LabelDialog, type LabelTarget } from "./LabelDialog";
 import { ImportDrawer } from "./ImportDrawer";
 import { ImageGallery } from "./ImageGallery";
 import { useScanHandler } from "@/components/scan/ScanProvider";
+import { CategoryMultiSelect } from "@/components/CategoryMultiSelect";
+import { expandCategorySelection } from "@/lib/categories";
 import { parseScan } from "@/lib/barcode";
 import { ensureCatalog, lookupBarcodeLoose } from "@/lib/catalog-cache";
 import { beepOk, beepError } from "@/lib/sound";
@@ -77,7 +79,16 @@ export function ProductsClient({
   const editParam = sp.get("edit");   // scanner: edit this product id
   const [q, setQ] = useState(initialQ);
   const [debouncedQ, setDebouncedQ] = useState(initialQ);
-  const [cat, setCat] = useState("");
+  // Phase I — multi-select category filter, the SAME component and rollup rule
+  // Low Stock (Stock page) already uses: picking a main category also matches
+  // every product in its sub-categories.
+  const [catIds, setCatIds] = useState<string[]>([]);
+  const expandedCats = useMemo(
+    () => (catIds.length ? [...expandCategorySelection(catIds, catTree)] : []),
+    [catIds, catTree],
+  );
+  // Stable cache key for the expanded set (arrays are new objects every render).
+  const catKey = expandedCats.join(",");
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [editVariant, setEditVariant] = useState<VariantRow | null>(null);
@@ -158,17 +169,17 @@ export function ProductsClient({
     return () => clearTimeout(t);
   }, [q]);
 
-  const isDefaultView = debouncedQ === "" && cat === "";
+  const isDefaultView = debouncedQ === "" && catIds.length === 0;
 
   const {
     data, fetchNextPage, hasNextPage, isFetching, isFetchingNextPage, isLoading,
   } = useInfiniteQuery({
-    queryKey: ["products", debouncedQ, cat],
+    queryKey: ["products", debouncedQ, catKey],
     initialPageParam: 0,
     queryFn: ({ pageParam }) =>
       searchProducts({
         q: debouncedQ || undefined,
-        categoryId: cat || undefined,
+        categoryIds: expandedCats.length ? expandedCats : undefined,
         offset: pageParam as number,
         limit: PRODUCTS_PAGE_SIZE,
       }),
@@ -231,7 +242,7 @@ export function ProductsClient({
   // through the ENTIRE catalogue server-side (no silent 1000-row cap).
   const fetchExportRows = useCallback(async () => {
     const { rows } = await searchAllProducts({
-      q: debouncedQ || undefined, categoryId: cat || undefined,
+      q: debouncedQ || undefined, categoryIds: expandedCats.length ? expandedCats : undefined,
     });
     return rows.flatMap((p) =>
       p.variants.map((v) => ({
@@ -240,7 +251,7 @@ export function ProductsClient({
         price: v.sale_price, on_hand: v.on_hand,
       })),
     );
-  }, [debouncedQ, cat]);
+  }, [debouncedQ, catKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div>
@@ -282,12 +293,12 @@ export function ProductsClient({
             className="pl-9"
           />
         </div>
-        <Select value={cat} onChange={(e) => setCat(e.target.value)} className="sm:w-64">
-          <option value="">All categories</option>
-          {categories.map((c) => (
-            <option key={c.id} value={c.id}>{c.name}</option>
-          ))}
-        </Select>
+        <CategoryMultiSelect
+          categories={catTree}
+          selected={catIds}
+          onChange={setCatIds}
+          className="sm:w-64"
+        />
       </Card>
 
       {isLoading ? (

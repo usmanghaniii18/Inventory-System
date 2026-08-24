@@ -48,6 +48,7 @@ export default async function PosPage() {
     logo_url: info.logo_url,
     receipt_header: info.receipt_header,
     receipt_footer: info.receipt_footer,
+    receipt_disclaimer: info.receipt_disclaimer,
     tax_percent: Number(settings?.tax_percent ?? 0),
   };
 

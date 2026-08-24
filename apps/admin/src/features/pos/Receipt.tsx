@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Printer, Plus, Loader2 } from "lucide-react";
 import { Button } from "@hamza/shared/ui/Button";
 import { useToast } from "@hamza/shared/ui/Toast";
 import { type ReceiptData } from "@/lib/receipt";
-import { receiptHtml, printReceiptHtml } from "@/lib/receipt-html";
+import { receiptHtml, printReceiptHtml, isPrintableReceipt } from "@/lib/receipt-html";
 
 /**
  * Post-sale receipt. The preview and the Print action render the SAME 80mm
@@ -28,7 +28,12 @@ export function Receipt({
   const previewHtml = useMemo(() => (data ? receiptHtml(data, { autoPrint: false }) : null), [data]);
 
   function printPdf() {
-    if (!data) return;
+    // Same guard as the F9 shortcut — this button is also reachable by Enter
+    // while the dialog is open, so it must be equally unable to throw.
+    if (!isPrintableReceipt(data)) {
+      toast("Nothing to print yet", "error");
+      return;
+    }
     setPrinting(true);
     try {
       // Print a compact 80mm thermal receipt (HTML + @page size) — not an A4 PDF.
@@ -39,6 +44,24 @@ export function Receipt({
       setPrinting(false);
     }
   }
+
+  // Phase C — with the receipt up, Enter prints straight away (the Print button
+  // is focused on open) and Esc starts the next sale. Together with F4 → Enter
+  // in the payment sheet that makes a full bill+print two Enter presses, no
+  // menu walking. F9 / Ctrl+P still work here because PosClient listens on
+  // window and this modal doesn't swallow them.
+  const printRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!data) return;
+    const t = setTimeout(() => printRef.current?.focus(), 60);
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); printPdf(); }
+      else if (e.key === "Escape") { e.preventDefault(); onClose(); }
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => { clearTimeout(t); window.removeEventListener("keydown", onKey, true); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
 
   if (!data) return null;
 
@@ -67,11 +90,13 @@ export function Receipt({
         </div>
 
         <div className="grid grid-cols-1 gap-2 border-t border-border p-4">
-          <Button variant="secondary" onClick={printPdf} disabled={printing}>
+          <Button ref={printRef} onClick={printPdf} disabled={printing} className="py-3">
             {printing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Printer className="h-4 w-4" />} Print
+            <kbd className="ml-1 rounded border border-white/40 px-1 text-[10px] font-normal opacity-80">Enter</kbd>
           </Button>
-          <Button className="py-3" onClick={onClose}>
+          <Button variant="secondary" onClick={onClose}>
             <Plus className="h-4 w-4" /> New sale
+            <kbd className="ml-1 rounded border border-border px-1 text-[10px] font-normal opacity-70">Esc</kbd>
           </Button>
         </div>
       </div>

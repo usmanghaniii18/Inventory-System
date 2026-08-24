@@ -1,6 +1,11 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // Lets a production build live somewhere other than .next, so `next start`
+  // can be served alongside a running `next dev` (which owns .next) during
+  // local testing. Unset — the normal case, including deploys — it is exactly
+  // the previous behaviour.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   // Shared workspace package consumed as TS source.
   transpilePackages: ["@hamza/shared"],
   images: {

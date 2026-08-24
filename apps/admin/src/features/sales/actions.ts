@@ -246,6 +246,7 @@ export async function getSaleReceiptData(saleId: string, netOfReturns = true): P
       name: settings?.store_name ?? "Hamza General Store",
       address: info.address, phone: info.phone, ntn: info.ntn, logo_url: info.logo_url,
       header: info.receipt_header, footer: info.receipt_footer,
+      disclaimer: info.receipt_disclaimer,
     },
     receipt_no: detail.receipt_no,
     date: new Date(detail.created_at).toLocaleString("en-PK", { dateStyle: "medium", timeStyle: "short" }),

@@ -32,7 +32,11 @@ export interface ReportData {
   columns: ReportColumn[];
   rows: Record<string, unknown>[];
   dimensions: DimensionFilter[];
-  /** Multi-select category (main + sub, rollup) filter — currently Inventory Valuation only. */
+  /**
+   * Multi-select category (main + sub, rollup) filter. Rendered by ReportsClient
+   * whenever a report supplies it: Inventory Valuation, Profit & Margin and
+   * Stock Additions (Phase I).
+   */
   categoryFilter?: { options: CategoryFilterOption[] };
 }
 
@@ -402,22 +406,57 @@ async function profitReport(supabase: Supabase, range: DateRange, params: URLSea
   const returns = await fetchReturns(supabase, range);
   const variants = await getVariantOptions(supabase);
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
+
+  // Phase I — multi-select category filter (main category rolls up its subs).
+  const { options: cats, scope: catScope } = await categoryScope(supabase, params);
+  const inScope = (variantId: string | null | undefined) => {
+    if (!catScope) return true;
+    const v = variantId ? vMap.get(variantId) : undefined;
+    return !!v?.category_id && catScope.has(v.category_id);
+  };
+
+  const scopedItems = catScope ? items.filter((it) => inScope(it.variant_id as string)) : items;
+  const saleDateOf = new Map(sales.map((x) => [x.id, x.created_at]));
+
   // Net (default): refunds reduce revenue and COGS returns to stock, and revenue
   // is what was actually paid after the bill-level discount. Gross: list-price
   // revenue, COGS and revenue both left un-netted against returns.
   const retRevenue = mode === "net" ? returns.totalRevenue : 0;
   const retCogs = mode === "net" ? returns.totalCogs : 0;
-  const revenue = sales.reduce((s, x) => s + saleRevenue(x, mode), 0) + web.reduce((s, x) => s + webRevenue(x, mode), 0) - retRevenue;
-  const cogs = sales.reduce((s, x) => s + Number(x.cogs_total), 0) + web.reduce((s, x) => s + x.cogs, 0) - retCogs;
+
+  // With NO category filter the headline figures come from the sale headers,
+  // exactly as before — that path is untouched. With a filter on, they have to
+  // be rebuilt from the lines, because a sale header covers every category on
+  // the bill and cannot be attributed to one.
+  let revenue: number;
+  let cogs: number;
+  if (catScope) {
+    let scopedRetRevenue = 0;
+    let scopedRetCogs = 0;
+    if (mode === "net") for (const [vid, rv] of returns.byVariant) {
+      if (!inScope(vid)) continue;
+      scopedRetRevenue += rv.revenue; scopedRetCogs += rv.cogs;
+    }
+    revenue = scopedItems.reduce((t, it) => t + lineRevenue(it, mode), 0) - scopedRetRevenue;
+    cogs = scopedItems.reduce((t, it) => t + Number(it.qty) * Number(it.unit_cogs), 0) - scopedRetCogs;
+  } else {
+    revenue = sales.reduce((s, x) => s + saleRevenue(x, mode), 0) + web.reduce((s, x) => s + webRevenue(x, mode), 0) - retRevenue;
+    cogs = sales.reduce((s, x) => s + Number(x.cogs_total), 0) + web.reduce((s, x) => s + x.cogs, 0) - retCogs;
+  }
   const profit = revenue - cogs;
   const margin = revenue ? (profit / revenue) * 100 : 0;
 
-  const agg = new Map<string, { name: string; revenue: number; cogs: number; profit: number; margin: number }>();
-  for (const it of items) {
+  const catName = new Map(cats.map((c) => [c.id, c.name]));
+  const agg = new Map<string, { name: string; category: string; revenue: number; cogs: number; profit: number; margin: number }>();
+  for (const it of scopedItems) {
     const v = vMap.get(it.variant_id as string);
     const k = it.variant_id as string;
     const rev = lineRevenue(it, mode); const c = Number(it.qty) * Number(it.unit_cogs);
-    const cur = agg.get(k) ?? { name: v ? `${v.product_name} · ${v.label}` : "—", revenue: 0, cogs: 0, profit: 0, margin: 0 };
+    const cur = agg.get(k) ?? {
+      name: v ? `${v.product_name} · ${v.label}` : "—",
+      category: v?.category_id ? (catName.get(v.category_id) ?? "—") : "Uncategorised",
+      revenue: 0, cogs: 0, profit: 0, margin: 0,
+    };
     cur.revenue += rev; cur.cogs += c; cur.profit += rev - c;
     agg.set(k, cur);
   }
@@ -435,32 +474,51 @@ async function profitReport(supabase: Supabase, range: DateRange, params: URLSea
       { label: "Gross Profit", value: formatPKR(profit, { compact: true }), fullValue: formatPKR(profit), accent: "green", sensitive: true },
       { label: "Margin", value: `${margin.toFixed(1)}%`, accent: "teal", sensitive: true },
     ],
-    charts: [{ ...trend(range, [
-      ...sales.map((s) => ({ created_at: s.created_at, value: saleProfit(s, mode) })),
-      ...web.map((w) => ({ created_at: w.created_at, value: webProfit(w, mode) })),
-      ...(mode === "net" ? returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.profit })) : []),
-    ], "green", "profit"), title: "Profit trend" }],
+    charts: [{ ...trend(range, catScope
+      // Filtered: the trend has to come from the lines too, for the same reason
+      // the KPIs do — a sale header spans every category on the bill. Dates come
+      // from the already-fetched sale headers, not the PostgREST embed shape.
+      ? scopedItems.map((it) => ({ created_at: saleDateOf.get(it.sale_id as string) ?? iso(range.from), value: lineProfit(it, mode) }))
+      : [
+        ...sales.map((s) => ({ created_at: s.created_at, value: saleProfit(s, mode) })),
+        ...web.map((w) => ({ created_at: w.created_at, value: webProfit(w, mode) })),
+        ...(mode === "net" ? returns.byDate.map((r) => ({ created_at: r.created_at, value: -r.profit })) : []),
+      ], "green", "profit"), title: "Profit trend" }],
     columns: [
-      { key: "name", header: "Product", kind: "text" }, { key: "revenue", header: "Revenue", align: "right", kind: "pkr" },
+      { key: "name", header: "Product", kind: "text" }, { key: "category", header: "Category", kind: "text" },
+      { key: "revenue", header: "Revenue", align: "right", kind: "pkr" },
       { key: "cogs", header: "COGS", align: "right", kind: "pkr" }, { key: "profit", header: "Profit", align: "right", kind: "pkr" },
       { key: "margin", header: "Margin", align: "right", kind: "pct" },
     ],
     rows, dimensions: [],
+    categoryFilter: { options: cats },
   };
+}
+
+/**
+ * PHASE I — shared multi-select category scope for a report.
+ *
+ * Reads the `categories` URL param (written by CategoryMultiSelect) and expands
+ * a selected MAIN category to include its sub-categories, using the exact same
+ * helper the Stock/Low-Stock filter uses, so a category means the same thing on
+ * every screen. Returns null for "no filter", which every caller treats as the
+ * unchanged all-categories behaviour.
+ */
+async function categoryScope(
+  supabase: Supabase,
+  params: URLSearchParams,
+): Promise<{ options: CategoryFilterOption[]; scope: Set<string> | null }> {
+  const options = await categoryList(supabase);
+  const selected = (params.get("categories") ?? "").split(",").filter(Boolean);
+  return { options, scope: selected.length ? expandCategorySelection(selected, options) : null };
 }
 
 /* ---------------- 3. Inventory valuation (point-in-time) ---------------- */
 async function inventoryReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   const variants = await getVariantOptions(supabase);
   const vMap = new Map(variants.map((v) => [v.variant_id, v]));
-  const cats = await categoryList(supabase);
+  const { options: cats, scope: catScope } = await categoryScope(supabase, params);
   const catName = new Map(cats.map((c) => [c.id, c.name]));
-
-  // Category filter (multi-select, main + sub). Empty selection = all
-  // categories (unchanged default behaviour). Selecting a main category rolls
-  // up to include its sub-categories, same as the Categories tab / Stock filter.
-  const selectedCats = (params.get("categories") ?? "").split(",").filter(Boolean);
-  const catScope = selectedCats.length ? expandCategorySelection(selectedCats, cats) : null;
 
   // reconstruct on-hand as of range.to from the ledger (physical legs only)
   const { data: physLocs } = await supabase.from("locations").select("id").eq("type", "PHYSICAL");
@@ -525,9 +583,11 @@ async function inventoryReport(supabase: Supabase, range: DateRange, params: URL
 // and user.
 async function stockInReport(supabase: Supabase, range: DateRange, params: URLSearchParams): Promise<ReportData> {
   const fProduct = params.get("product") ?? "";
-  const fCategory = params.get("category") ?? "";
   const fSupplier = params.get("supplier") ?? "";
   const fUser = params.get("user") ?? "";
+  // Phase I — multi-select categories (with main→sub rollup), replacing the old
+  // single-value `category` dimension.
+  const { options: catOptions, scope: catScope } = await categoryScope(supabase, params);
 
   // Supplier-type locations mark a stock addition (in-flow from outside).
   const { data: locs } = await supabase.from("locations").select("id, type");
@@ -568,7 +628,6 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
   // Names resolve from the FULL catalogue (incl. archived) so a historical
   // stock-addition row never renders blank after its product is archived.
   const nameMap = await getVariantNames(supabase);
-  const catName = await categoryNames(supabase);
   const profiles = await profileNames(supabase);
 
   type Add = Record<string, unknown> & { _cat: string | null; _sup: string; created_at: string; qty: number; value: number; product: string };
@@ -588,7 +647,7 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
       user: m.created_by ? (profiles.get(m.created_by) ?? "—") : "—",
     };
   });
-  if (fCategory) rows = rows.filter((r) => r._cat === fCategory);
+  if (catScope) rows = rows.filter((r) => !!r._cat && catScope.has(r._cat));
   if (fSupplier) rows = rows.filter((r) => r._sup === fSupplier);
 
   const totalQty = rows.reduce((s, r) => s + r.qty, 0);
@@ -596,9 +655,6 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
 
   // dimension option lists (distinct, from full data)
   const productOpts = [...new Map(variants.map((v) => [v.product_id, v.product_name])).entries()]
-    .map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
-  const usedCats = new Set(variants.map((v) => v.category_id).filter(Boolean) as string[]);
-  const categoryOpts = [...catName.entries()].filter(([id]) => usedCats.has(id))
     .map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
   const supplierOpts = (suppliers ?? []).map((s) => ({ value: s.id, label: s.name as string })).sort((a, b) => a.label.localeCompare(b.label));
   const userOpts = [...profiles.entries()].map(([value, label]) => ({ value, label: label as string })).sort((a, b) => a.label.localeCompare(b.label));
@@ -624,10 +680,10 @@ async function stockInReport(supabase: Supabase, range: DateRange, params: URLSe
     rows,
     dimensions: [
       { key: "product", label: "All products", options: productOpts },
-      { key: "category", label: "All categories", options: categoryOpts },
       { key: "supplier", label: "All suppliers", options: supplierOpts },
       { key: "user", label: "All users", options: userOpts },
     ],
+    categoryFilter: { options: catOptions },
   };
 }
 

@@ -8,6 +8,7 @@ import { fetchProductsPage, fetchAllProducts, type ProductsQuery, type ProductsP
 import { generateInternalEan13, generateWeightTemplateEan13 } from "@/lib/barcode";
 import { productInputSchema, variantPatchSchema, importRowsSchema, firstIssue } from "@hamza/shared/validation";
 import type { ParsedProductRow } from "@/lib/csv";
+import { productSlug } from "@/lib/product-slug";
 
 /**
  * Server-side paginated + filtered product search. Powers the Products list's
@@ -24,13 +25,9 @@ export async function searchProducts(params: ProductsQuery): Promise<ProductsPag
  * catalogue server-side so the export never stops at PostgREST's 1000-row cap
  * (loads up to 15,000+ products with nothing dropped).
  */
-export async function searchAllProducts(params: Pick<ProductsQuery, "q" | "categoryId">): Promise<{ rows: ProductRow[] }> {
+export async function searchAllProducts(params: Pick<ProductsQuery, "q" | "categoryId" | "categoryIds">): Promise<{ rows: ProductRow[] }> {
   const supabase = await createClient();
   return { rows: await fetchAllProducts(supabase, params) };
-}
-
-function slugify(s: string) {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
 
 async function requireManager() {
@@ -128,6 +125,58 @@ export interface ProductInput {
 }
 
 /**
+ * Give every variant of a JUST-CREATED product a scannable internal barcode
+ * when none was typed in.
+ *
+ * Why: `create_product_full` only writes a product_barcodes row when the form
+ * supplied a barcode, so a product added without one had NO barcode at all
+ * until somebody remembered to open Products → Label → "Generate internal
+ * barcode". That easily-missed manual step is why items were turning up at the
+ * till with nothing to scan. New products now leave the Add form scannable.
+ *
+ * The generated value is a GS1 prefix-2 EAN-13 built from a database sequence —
+ * fixed 13 digits, unique, and completely independent of the product's name, so
+ * a one-letter name and a forty-letter name produce identically sized symbols.
+ *
+ * SAFETY: this only ever INSERTS a barcode for a variant that has none. It
+ * never reads, rewrites or regenerates an existing product_barcodes row, so no
+ * sticker already on a shelf can be invalidated by it.
+ */
+async function ensureVariantBarcodes(
+  db: ReturnType<typeof createAdminClient>,
+  productId: string,
+  variableWeight = false,
+): Promise<void> {
+  const { data: variants } = await db
+    .from("product_variants").select("id").eq("product_id", productId);
+  const ids = (variants ?? []).map((v) => v.id as string);
+  if (!ids.length) return;
+
+  const { data: existing } = await db
+    .from("product_barcodes").select("variant_id").in("variant_id", ids);
+  const have = new Set((existing ?? []).map((b) => b.variant_id as string));
+  const missing = ids.filter((id) => !have.has(id));
+  if (!missing.length) return;
+
+  const rows: { product_id: string; variant_id: string; barcode: string; type: string; is_primary: boolean }[] = [];
+  for (const variantId of missing) {
+    const { data: seq, error } = await db.rpc("next_internal_barcode");
+    if (error) return; // sequence unavailable — leave it to the Label dialog
+    const n = Number(seq);
+    rows.push({
+      product_id: productId,
+      variant_id: variantId,
+      barcode: variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n),
+      type: "INTERNAL",
+      is_primary: true,
+    });
+  }
+  // Ignore a unique-violation here: a barcode is a convenience, never a reason
+  // to fail a product the user has already successfully created.
+  await db.from("product_barcodes").insert(rows);
+}
+
+/**
  * Create a product as a parent grouping plus one or more variants.
  * Stock is posted per-variant through the append-only ledger.
  */
@@ -142,7 +191,7 @@ export async function createProduct(input: ProductInput) {
   // barcodes + option links + opening stock (was up to ~35 sequential calls).
   const payload = {
     ...input,
-    slug: `${slugify(input.name)}-${slugify(input.variants[0].sku)}`,
+    slug: productSlug(input.name, input.variants[0].sku),
     created_by: user.id,
   };
   const { data, error } = await db.rpc("create_product_full", { payload });
@@ -153,6 +202,9 @@ export async function createProduct(input: ProductInput) {
       : error.message;
     return { error: msg };
   }
+
+  // Phase D — a new product leaves this form scannable, no second manual step.
+  await ensureVariantBarcodes(db, data as string);
 
   revalidatePath("/admin/products");
   revalidatePath("/admin/stock");
@@ -447,11 +499,14 @@ export async function importProducts(rows: ParsedProductRow[]) {
         opening_qty: r.qty || 0,
         option_values: [],
       }],
-      slug: `${slugify(r.name)}-${slugify(r.sku)}`,
+      slug: productSlug(r.name, r.sku),
       created_by: user.id,
     };
     const { data: productId, error } = await db.rpc("create_product_full", { payload });
     if (error || !productId) continue;
+
+    // Imported rows without a barcode column get one too (same guarantee).
+    await ensureVariantBarcodes(db, productId as string);
 
     // Image(s): one or more URLs separated by "|" (first = cover), mirroring the
     // gallery so a CSV image link displays exactly like an uploaded photo.

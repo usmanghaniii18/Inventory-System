@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Banknote, NotebookPen, Smartphone,
   X, Plus, Trash2, Loader2, Check,
@@ -53,6 +53,31 @@ export function PaymentSheet({
     }
   }, [open, total]);
 
+  // `confirm()` is declared further down (it closes over values computed after
+  // the `if (!open) return null` guard), so the keydown listener reaches it
+  // through this ref. The useRef MUST live up here with the other hooks: React
+  // requires every hook to run on every render, and this component returns
+  // early when it is closed. Declaring it next to `confirm()` meant the closed
+  // sheet ran 6 hooks and the open sheet ran 7, which threw
+  // "Rendered more hooks than during the previous render" the moment Charge was
+  // pressed. The assignment below the guard is a plain assignment, not a hook,
+  // so it is fine where it is.
+  const confirmRef = useRef<() => void>(() => {});
+
+  // Phase C — Enter confirms the payment from anywhere in the sheet (including
+  // the amount fields), Esc backs out. F4 → Enter now completes a bill.
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (processing) return;
+      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); confirmRef.current(); }
+      else if (e.key === "Escape") { e.preventDefault(); onClose(); }
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, processing]);
+
   if (!open) return null;
 
   const paid = round2(lines.reduce((s, l) => s + (Number(l.amount) || 0), 0));
@@ -92,6 +117,7 @@ export function PaymentSheet({
     if (hasUdhaar && !customerId) return toast("Attach a customer for udhaar", "error");
     onConfirm(lines.filter((l) => Number(l.amount) > 0), change);
   }
+  confirmRef.current = confirm;
 
   return (
     <div className="fixed inset-0 z-[60] flex items-end justify-center sm:items-center">
@@ -200,6 +226,7 @@ export function PaymentSheet({
             {processing ? <Loader2 className="h-5 w-5 animate-spin" /> : <Check className="h-5 w-5" />}
             Charge {formatPKR(total)}
             {lines.length > 0 && <span className="opacity-80">· {lines.map((l) => LABEL[l.method]).join(" + ")}</span>}
+            <kbd className="ml-1 rounded border border-white/40 px-1 text-[10px] font-normal opacity-80">Enter</kbd>
           </Button>
         </div>
       </div>

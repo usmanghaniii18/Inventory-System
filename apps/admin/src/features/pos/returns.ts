@@ -6,6 +6,7 @@ import { getCurrentUser } from "@hamza/shared/auth";
 import { returnSchema, firstIssue } from "@hamza/shared/validation";
 import { netUnitPaid, splitUdhaarRefund } from "@hamza/shared/pricing";
 import type { PayMethod } from "./actions";
+import { returnWindowDays, isWithinReturnWindow } from "@/lib/return-window";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -69,9 +70,8 @@ export async function getSaleForReturn(receiptNo: string): Promise<SaleForReturn
   const nameMap = new Map((cat ?? []).map((c) => [c.variant_id, c]));
 
   const { data: settings } = await db.from("settings").select("store_info").eq("id", 1).maybeSingle();
-  const windowDays = Number((settings?.store_info as Record<string, unknown> | null)?.return_window_days ?? 7);
-  const ageDays = (Date.now() - new Date(sale.created_at).getTime()) / 86_400_000;
-  const within = windowDays <= 0 || ageDays <= windowDays;
+  const windowDays = returnWindowDays(settings?.store_info as Record<string, unknown> | null);
+  const within = isWithinReturnWindow(sale.created_at as string, windowDays);
 
   const list: ReturnableItem[] = (items ?? []).map((it) => {
     const returned = retMap.get(it.id) ?? 0;
@@ -136,10 +136,9 @@ export async function processReturn(input: {
 
   // Return window.
   const { data: settings } = await db.from("settings").select("store_info").eq("id", 1).maybeSingle();
-  const windowDays = Number((settings?.store_info as Record<string, unknown> | null)?.return_window_days ?? 7);
-  if (sale && windowDays > 0) {
-    const age = (Date.now() - new Date(sale.created_at).getTime()) / 86_400_000;
-    if (age > windowDays) return { error: `Outside the ${windowDays}-day return window.` };
+  const windowDays = returnWindowDays(settings?.store_info as Record<string, unknown> | null);
+  if (sale && !isWithinReturnWindow(sale.created_at as string, windowDays)) {
+    return { error: `Outside the ${windowDays}-day return window.` };
   }
 
   // Refund = the net amount actually paid for each returned line: its line_total

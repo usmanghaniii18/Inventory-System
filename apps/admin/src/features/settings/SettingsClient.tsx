@@ -18,6 +18,7 @@ import { Avatar } from "@hamza/shared/ui/Avatar";
 import { useToast } from "@hamza/shared/ui/Toast";
 import { useTheme } from "@hamza/shared/theme/ThemeProvider";
 import { cn } from "@hamza/shared/utils";
+import { DEFAULT_RECEIPT_DISCLAIMER } from "@/lib/receipt-html";
 import {
   updateStoreProfile, updateInventorySettings, updateSalesSettings, updateIntegrations,
   inviteUser, updateUserRole, setUserActive, resetUserPassword, changePassword,
@@ -30,6 +31,10 @@ const LOGO_MAX_BYTES = 5_242_880; // 5 MB
 export interface SettingsData {
   store_name: string; costing_method: "WEIGHTED_AVERAGE" | "FIFO"; tax_percent: number; currency: string;
   address: string; phone: string; ntn: string; receipt_header: string; receipt_footer: string; logo_url: string;
+  /** Phase F — disclaimer printed on every receipt. Blank = built-in default. */
+  receipt_disclaimer: string;
+  /** Phase H — days a sale stays returnable (0 = no limit). */
+  return_window_days: number;
   low_stock_default: number; barcode_format: string; default_unit: string;
   rounding: string; receipt_template: string; allow_discounts: boolean;
   courier: Record<string, string>; resend_key: string; whatsapp_key: string; from_email: string; notif_prefs: Record<string, unknown>;
@@ -142,7 +147,7 @@ function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
     <Card>
       <CardHeader><CardTitle className="flex items-center gap-2"><Store className="h-4 w-4" /> Store profile</CardTitle></CardHeader>
       <CardBody>
-        <form onSubmit={(e) => { e.preventDefault(); run(() => updateStoreProfile({ store_name: f.store_name, currency: f.currency, tax_percent: Number(f.tax_percent) || 0, address: f.address, phone: f.phone, ntn: f.ntn, receipt_header: f.receipt_header, receipt_footer: f.receipt_footer, logo_url: f.logo_url })); }} className="space-y-4">
+        <form onSubmit={(e) => { e.preventDefault(); run(() => updateStoreProfile({ store_name: f.store_name, currency: f.currency, tax_percent: Number(f.tax_percent) || 0, address: f.address, phone: f.phone, ntn: f.ntn, receipt_header: f.receipt_header, receipt_footer: f.receipt_footer, receipt_disclaimer: f.receipt_disclaimer, logo_url: f.logo_url })); }} className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-2">
             <div><Label>Store name</Label><Input value={f.store_name} disabled={!isOwner} onChange={set("store_name")} /></div>
             <div><Label>Phone</Label><Input value={f.phone} disabled={!isOwner} onChange={set("phone")} /></div>
@@ -184,6 +189,14 @@ function StoreSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
           <div className="grid gap-3 sm:grid-cols-2">
             <div><Label>Receipt header</Label><Input value={f.receipt_header} disabled={!isOwner} onChange={set("receipt_header")} /></div>
             <div><Label>Receipt footer</Label><Input value={f.receipt_footer} disabled={!isOwner} onChange={set("receipt_footer")} placeholder="Thank you!" /></div>
+            <div className="sm:col-span-2">
+              <Label>Receipt disclaimer</Label>
+              <Input value={f.receipt_disclaimer} disabled={!isOwner} onChange={set("receipt_disclaimer")} placeholder={DEFAULT_RECEIPT_DISCLAIMER} />
+              <p className="mt-1 text-xs text-text-tertiary">
+                Printed on every receipt, just above the footer. Leave blank to use the
+                default: “{DEFAULT_RECEIPT_DISCLAIMER}”.
+              </p>
+            </div>
           </div>
           {isOwner ? <Button type="submit" disabled={saving || uploadingLogo}>{saving && <Loader2 className="h-4 w-4 animate-spin" />} Save profile</Button> : <OwnerNote isOwner={isOwner} />}
         </form>
@@ -334,11 +347,21 @@ function SalesSection({ data, isOwner }: { data: SettingsData; isOwner: boolean 
     <Card>
       <CardHeader><CardTitle className="flex items-center gap-2"><Receipt className="h-4 w-4" /> Sales settings</CardTitle></CardHeader>
       <CardBody>
-        <form onSubmit={(e) => { e.preventDefault(); run(() => updateSalesSettings({ tax_percent: Number(f.tax_percent) || 0, rounding: f.rounding, receipt_template: f.receipt_template, allow_discounts: f.allow_discounts })); }} className="space-y-4">
+        <form onSubmit={(e) => { e.preventDefault(); run(() => updateSalesSettings({ tax_percent: Number(f.tax_percent) || 0, rounding: f.rounding, receipt_template: f.receipt_template, allow_discounts: f.allow_discounts, return_window_days: Number(f.return_window_days) || 0 })); }} className="space-y-4">
           <div className="grid gap-3 sm:grid-cols-3">
             <div><Label>Tax (%)</Label><Input type="number" value={f.tax_percent} disabled={!isOwner} onChange={(e) => setF((s) => ({ ...s, tax_percent: Number(e.target.value) }))} /></div>
             <div><Label>Rounding</Label><Select value={f.rounding} disabled={!isOwner} onChange={(e) => setF((s) => ({ ...s, rounding: e.target.value }))}><option value="none">None</option><option value="nearest_1">Nearest ₨1</option><option value="nearest_5">Nearest ₨5</option></Select></div>
             <div><Label>Receipt template</Label><Select value={f.receipt_template} disabled={!isOwner} onChange={(e) => setF((s) => ({ ...s, receipt_template: e.target.value }))}><option value="standard">Standard</option><option value="compact">Compact</option></Select></div>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div>
+              <Label>Return window (days)</Label>
+              <Input type="number" min={0} value={f.return_window_days} disabled={!isOwner}
+                onChange={(e) => setF((s) => ({ ...s, return_window_days: Number(e.target.value) }))} />
+              <p className="mt-1 text-xs text-text-tertiary">
+                A sale stays returnable for this many days. 0 = no time limit.
+              </p>
+            </div>
           </div>
           <label className="flex cursor-pointer items-center gap-2 text-sm text-text-secondary">
             <input type="checkbox" checked={f.allow_discounts} disabled={!isOwner} onChange={(e) => setF((s) => ({ ...s, allow_discounts: e.target.checked }))} className="h-4 w-4 rounded border-border" /> Allow discounts at POS

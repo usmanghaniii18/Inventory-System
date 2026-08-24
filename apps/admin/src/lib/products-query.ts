@@ -57,7 +57,15 @@ export interface ProductsPage {
 
 export interface ProductsQuery {
   q?: string;
+  /** Single-category filter. Kept for existing callers; prefer categoryIds. */
   categoryId?: string;
+  /**
+   * Phase I — multi-select category filter. Already EXPANDED by the caller so a
+   * selected main category includes its sub-categories (see
+   * lib/categories.expandCategorySelection, the same helper Low Stock uses).
+   * An empty/omitted list means "all categories", unchanged from before.
+   */
+  categoryIds?: string[];
   /** Fetch exactly one product by id (used when the scanner opens it to edit). */
   productId?: string;
   offset?: number;
@@ -87,7 +95,8 @@ export async function fetchProductsPage(supabase: SupabaseClient<any>, params: P
     .order("id")
     .range(offset, offset + limit - 1);
   if (params.productId) pq = pq.eq("id", params.productId);
-  if (params.categoryId) pq = pq.eq("category_id", params.categoryId);
+  if (params.categoryIds?.length) pq = pq.in("category_id", params.categoryIds);
+  else if (params.categoryId) pq = pq.eq("category_id", params.categoryId);
   if (term) pq = pq.or(`name.ilike.%${term}%,brand.ilike.%${term}%,sku.ilike.%${term}%`);
 
   const { data: products, count, error } = await pq;

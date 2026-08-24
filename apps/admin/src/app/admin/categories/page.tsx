@@ -2,18 +2,21 @@ import type { Metadata } from "next";
 import { createClient } from "@hamza/shared/supabase/server";
 import { fetchAll } from "@/lib/fetch-all";
 import { CategoriesClient, type CategoryNode } from "@/features/categories/CategoriesClient";
+import { getArchivedCounts } from "@/features/categories/archived";
 
 export const metadata: Metadata = { title: "Categories" };
 
 export default async function CategoriesPage() {
   const supabase = await createClient();
-  const [{ data: cats }, prods] = await Promise.all([
+  const [{ data: cats }, prods, archivedCounts] = await Promise.all([
     supabase.from("categories").select("id, name, parent_id, sort").order("sort").order("name"),
     // Paginated: a plain `.select("category_id")` silently caps at PostgREST's
     // 1000-row default, undercounting every category once the catalogue grows
     // past that (the same truncation bug fetchAll exists to prevent elsewhere).
     fetchAll<{ category_id: string | null }>((from, to) =>
-      supabase.from("products").select("category_id").order("id").range(from, to)),
+      supabase.from("products").select("category_id").eq("active", true).order("id").range(from, to)),
+    // Phase J — how many ARCHIVED products sit under each category.
+    getArchivedCounts(),
   ]);
 
   const direct = new Map<string, number>();
@@ -34,8 +37,29 @@ export default async function CategoriesPage() {
     return total;
   }
 
-  const nodes: CategoryNode[] = ((cats ?? []) as { id: string; name: string; parent_id: string | null }[])
-    .map((c) => ({ id: c.id, name: c.name, parent_id: c.parent_id, product_count: rollupCount(c.id) }));
+  // Archived counts roll up the same way active ones do.
+  const archivedCache = new Map<string, number>();
+  function archivedRollup(id: string): number {
+    const cached = archivedCache.get(id);
+    if (cached !== undefined) return cached;
+    let total = archivedCounts[id] ?? 0;
+    for (const childId of childrenOf.get(id) ?? []) total += archivedRollup(childId);
+    archivedCache.set(id, total);
+    return total;
+  }
 
-  return <CategoriesClient categories={nodes} />;
+  const nodes: CategoryNode[] = ((cats ?? []) as { id: string; name: string; parent_id: string | null }[])
+    .map((c) => ({
+      id: c.id, name: c.name, parent_id: c.parent_id,
+      product_count: rollupCount(c.id),
+      archived_count: archivedCounts[c.id] ?? 0,
+      archived_rollup: archivedRollup(c.id),
+    }));
+
+  return (
+    <CategoriesClient
+      categories={nodes}
+      uncategorisedArchived={archivedCounts["__uncategorised__"] ?? 0}
+    />
+  );
 }

@@ -259,6 +259,7 @@ export function StockClient({
           type={action.type}
           preselected={action.row}
           rows={rows}
+          categories={categories}
           locations={locations}
           onClose={() => setAction(null)}
           onDone={(msg) => { setAction(null); toast(msg); router.refresh(); queryClient.invalidateQueries({ queryKey: ["products"] }); }}
@@ -274,26 +275,36 @@ export function StockClient({
 /* ---------------- Variant picker (search + scan) ---------------- */
 
 function VariantPicker({
-  rows, value, onChange,
+  rows, categories, value, onChange,
 }: {
   rows: StockRow[];
+  categories: CategoryOption[];
   value: StockRow | null;
   onChange: (r: StockRow) => void;
 }) {
   const [term, setTerm] = useState("");
+  // Phase I — narrow the pickable products by category before searching, using
+  // the same multi-select + main→sub rollup as the Low Stock filter above.
+  const [catIds, setCatIds] = useState<string[]>([]);
+  const expanded = useMemo(() => expandCategorySelection(catIds, categories), [catIds, categories]);
+  const scoped = useMemo(
+    () => (catIds.length ? rows.filter((r) => r.category_id && expanded.has(r.category_id)) : rows),
+    [rows, catIds, expanded],
+  );
   const results = useMemo(() => {
     const t = term.trim().toLowerCase();
-    if (!t) return rows.slice(0, 8);
-    // exact barcode -> auto pick
+    if (!t) return scoped.slice(0, 8);
+    // exact barcode -> auto pick (searched across the WHOLE catalogue, so a scan
+    // still resolves even when a category filter is narrowing the list)
     const exact = rows.find((r) => r.barcode && r.barcode === term.trim());
     if (exact) return [exact];
-    return rows.filter((r) =>
+    return scoped.filter((r) =>
       r.product_name.toLowerCase().includes(t) ||
       r.label.toLowerCase().includes(t) ||
       r.sku.toLowerCase().includes(t) ||
       (r.barcode ?? "").includes(t),
     ).slice(0, 8);
-  }, [rows, term]);
+  }, [rows, scoped, term]);
 
   if (value) {
     return (
@@ -311,6 +322,9 @@ function VariantPicker({
 
   return (
     <div>
+      <div className="mb-2">
+        <CategoryMultiSelect categories={categories} selected={catIds} onChange={setCatIds} placeholder="All categories" />
+      </div>
       <div className="relative">
         <Barcode className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-tertiary" />
         <Input data-scan-input autoFocus value={term} onChange={(e) => setTerm(e.target.value)} placeholder="Scan barcode or search…" className="pl-9" />
@@ -347,11 +361,12 @@ const ACTION_META: Record<ActionType, { title: string; cta: string; desc: string
 };
 
 function ActionDrawer({
-  type, preselected, rows, locations, onClose, onDone, onError,
+  type, preselected, rows, categories, locations, onClose, onDone, onError,
 }: {
   type: ActionType;
   preselected?: StockRow;
   rows: StockRow[];
+  categories: CategoryOption[];
   locations: PhysLocation[];
   onClose: () => void;
   onDone: (msg: string) => void;
@@ -447,7 +462,7 @@ function ActionDrawer({
         <p className="rounded-lg bg-blue-tile/40 px-3 py-2 text-xs text-text-secondary">{meta.desc}</p>
         <div>
           <Label>Product / Variant</Label>
-          <VariantPicker rows={rows} value={variant} onChange={setVariant} />
+          <VariantPicker rows={rows} categories={categories} value={variant} onChange={setVariant} />
         </div>
 
         {type === "in" && (
