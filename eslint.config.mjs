@@ -14,8 +14,14 @@
 // and pressing "Charge" threw "Rendered more hooks than during the previous
 // render" straight into the route error boundary. Neither TypeScript nor
 // `next build` can see hook ordering. `react-hooks/rules-of-hooks` catches it in
-// one line, so it is set to ERROR and wired into the pre-build step: a violation
-// now fails the build instead of reaching a till.
+// one line, so it is set to ERROR and enforced by CI (.github/workflows/ci.yml)
+// on every push and pull request, so a violation is blocked before it can reach
+// the branch Railway deploys.
+//
+// Deliberately NOT wired into the deploy build: Railway builds apps/admin with
+// Root Directory = apps/admin, while eslint is declared only in the
+// workspace-root devDependencies — a lint step there is a way for a deploy to
+// fail without the application code being wrong.
 //
 // `next lint` is deprecated in Next 15.5 and removed in 16, so the lint scripts
 // call the ESLint CLI directly rather than going through Next.
