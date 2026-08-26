@@ -64,6 +64,13 @@ const SHORT_SCAN_MIN_LENGTH = 2;
 // several tries". A scanner echoing one trigger pull re-fires within a few tens
 // of ms; a person repositioning and pulling the trigger again takes far longer.
 const DEDUP_GAP_MS = 250;
+/**
+ * How late a timer may run before we treat it as a BLOCKED PAGE rather than as
+ * the silence it was scheduled to detect. Browsers routinely run timers a few
+ * ms late under no load at all; tens of ms late means something occupied the
+ * thread, and during that time the scanner's keys were queueing, not absent.
+ */
+const STALL_SLACK_MS = 50;
 
 /** Strip CR/LF/Tab and surrounding whitespace the scanner may add. */
 export function normalizeScan(raw: string): string {
@@ -86,6 +93,12 @@ export interface ScanKeyEvent {
   ctrlKey?: boolean;
   metaKey?: boolean;
   altKey?: boolean;
+  /**
+   * When the BROWSER created the event, on the same time origin as
+   * performance.now(). This is the scanner's own timing, and it is not the same
+   * thing as when this handler got to run — see stampOf().
+   */
+  timeStamp?: number;
   preventDefault(): void;
   stopPropagation(): void;
 }
@@ -141,6 +154,38 @@ export interface ScanDetector {
 export function createScanDetector(host: ScanDetectorHost): ScanDetector {
   const debug = () => host.debug ?? debugOn();
 
+  /**
+   * When the scanner sent this key — NOT when we got round to handling it.
+   *
+   * This distinction is the whole of one bug. Every gap in here is meant to
+   * describe the SCANNER's rhythm, but reading the clock inside the handler
+   * measures the browser's DISPATCH rhythm instead, and the two come apart the
+   * moment the main thread is busy. A catalogue refresh landing mid-burst
+   * re-renders the till's product grid; the keydowns the scanner already sent
+   * sit in the queue meanwhile and are delivered in a clump the instant the
+   * thread frees. Measured on the handler clock that clump looks like a long
+   * pause followed by a fresh burst, so the characters buffered before the
+   * stall were discarded as a stale sequence and the REMAINDER was flushed as
+   * if it were a whole code: "8961100001019" reached the till as
+   * "961100001019" and was reported as an unknown code.
+   *
+   * KeyboardEvent.timeStamp is stamped when the event is CREATED and shares
+   * performance.now()'s time origin, so a queued burst keeps its real 5ms gaps
+   * however long the page was blocked. That makes the detector immune to page
+   * stalls rather than merely less likely to trip over them.
+   *
+   * Falls back to the handler clock whenever the stamp is missing or on some
+   * other epoch (synthetic events, older engines): a stamp is only trusted when
+   * it is finite, positive and lands in the recent past on our own clock.
+   */
+  const stampOf = (e: ScanKeyEvent): number => {
+    const t = e.timeStamp;
+    const n = host.now();
+    if (typeof t !== "number" || !Number.isFinite(t) || t <= 0) return n;
+    // Must be on our clock: at most a hair in the future, at most a minute old.
+    return t <= n + 1 && t > n - 60_000 ? t : n;
+  };
+
   let buffer = "";
   let firstTs = 0; // timestamp of the first char in the buffer
   let lastTs = 0; // timestamp of the most recent char
@@ -190,16 +235,34 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
    * three IS a barcode, and typing a barcode into the scan box and pressing
    * Enter already added that product anyway — so the outcome is unchanged, the
    * cashier just does not have to reach for Enter.
+   *
+   * WHY THE SLOW ALLOWANCE IS NOT LENGTH-GATED ANY MORE
+   * ---------------------------------------------------
+   * It used to be. A burst of 8+ digits was allowed up to SLOW_DIGIT_GAP_MS,
+   * and everything shorter had to clear AVG_GAP_MS or be thrown away. That
+   * turned one scanner's speed into a rule about WHICH PRODUCTS scan: on a
+   * wedge whose mean gap sits between the two bars — a very ordinary speed for
+   * a cheap or jittery unit — every 12/13-digit manufacturer EAN read fine and
+   * every one of this shop's own shorter codes was refused, every time, on
+   * perfectly good labels. 841 of the 2,222 live codes are under 8 characters,
+   * so that split the catalogue almost in half along a line the cashier could
+   * see ("bought-in barcodes work, ours don't") and no amount of reprinting
+   * could fix, because nothing was wrong with the print.
+   *
+   * The slow allowance now applies at any length, but a burst that uses it must
+   * be EXACTLY a barcode the catalogue holds. That corroboration is what keeps
+   * it safe: the outcome of a false positive is the product the typed digits
+   * name, which is what pressing Enter on those digits does anyway.
    */
   const looksLikeScan = (terminated: boolean) => {
     const mean = avgGap();
-    if (buffer.length >= MIN_SCAN_LENGTH) {
-      if (mean <= AVG_GAP_MS) return true;
-      return buffer.length >= SLOW_DIGIT_MIN_LENGTH && mean <= SLOW_DIGIT_GAP_MS && /^\d+$/.test(buffer);
-    }
+    if (buffer.length >= MIN_SCAN_LENGTH && mean <= AVG_GAP_MS) return true;
+    // A long, uniform, all-digit burst needs no corroboration: nobody hand-types
+    // 8+ digits at a steady <=140ms/key.
+    if (buffer.length >= SLOW_DIGIT_MIN_LENGTH && mean <= SLOW_DIGIT_GAP_MS && /^\d+$/.test(buffer)) return true;
     if (!terminated) return false;
     if (buffer.length < SHORT_SCAN_MIN_LENGTH) return false;
-    if (mean > AVG_GAP_MS) return false;
+    if (mean > SLOW_DIGIT_GAP_MS) return false;
     return host.isKnownCode?.(normalizeScan(buffer)) === true;
   };
 
@@ -231,7 +294,7 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     return true;
   };
 
-  const flush = () => {
+  const flush = (at: number = host.now()) => {
     const raw = buffer;
     const hadLeak = leaked;
     const mean = avgGap();
@@ -239,7 +302,9 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     reset();
     const code = normalizeScan(raw);
     if (!code) return;
-    const now = host.now();
+    // Dedup compares against the scanner's own clock, so the moment the burst
+    // ENDED has to come from the same clock the gaps did.
+    const now = at;
     host.stripLeaked(hadLeak); // clean the field even if we end up deduping
     const quietGap = startedAt - lastFlushAt;
     if (code === lastCode && lastFlushAt > 0 && quietGap < DEDUP_GAP_MS) {
@@ -253,10 +318,28 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     host.onScan(code);
   };
 
+  /**
+   * The idle flush exists to close a burst the scanner ended without a
+   * terminator. It has to be able to tell SILENCE from a BLOCKED PAGE.
+   *
+   * A timer is not evidence that nothing happened — it is evidence that the
+   * thread got round to us. When the main thread is busy the callback runs late
+   * and the keys that arrived during the block are still queued behind it, so
+   * firing on that late tick would cut a burst in half and flush the front of a
+   * barcode as though it were the whole code. The deadline is therefore checked
+   * on arrival: if we are meaningfully past it, the silence was never observed
+   * and the wait simply starts again.
+   */
   const scheduleIdleFlush = () => {
     if (timer !== null) host.clearTimer(timer);
+    const deadline = host.now() + FLUSH_IDLE_MS;
     timer = host.setTimer(() => {
       timer = null;
+      if (host.now() > deadline + STALL_SLACK_MS) {
+        if (debug()) console.info("[scan] idle flush ran late — page was blocked, waiting again");
+        scheduleIdleFlush();
+        return;
+      }
       // Idle flush: no terminator arrived, so a short burst can never qualify.
       if (looksLikeScan(false)) flush();
       else abandon();
@@ -268,14 +351,15 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     // Let dedicated barcode/variant fields capture the scan themselves.
     if (host.focus() === "scan-target") { reset(); return; }
 
-    const now = host.now();
+    // The SCANNER's clock, not the handler's — see stampOf().
+    const now = stampOf(e);
 
     // Terminators — a wedge scanner usually ends the burst with Enter (or Tab).
     if (e.key === "Enter" || e.key === "Tab") {
       if (looksLikeScan(true)) {
         e.preventDefault();
         e.stopPropagation();
-        flush();
+        flush(now);
       } else {
         if (debug() && buffer.length >= SHORT_SCAN_MIN_LENGTH) {
           console.info("[scan] ignored (looks like typing)", { buffer, len: buffer.length, avgGapMs: Math.round(avgGap()) });

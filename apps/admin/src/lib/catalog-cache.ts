@@ -45,6 +45,11 @@ export interface CatalogSnapshot {
   items: CatalogItem[];
   byBarcode: Map<string, CatalogItem>;
   byVariant: Map<string, CatalogItem>;
+  /**
+   * Mutable: a reconcile that finds the catalogue UNCHANGED stamps these two in
+   * place rather than replacing the snapshot, so the till is not re-rendered
+   * for a no-op. Nothing renders either field. See refreshFromNetwork().
+   */
   fetchedAt: number;
   /** true once a network reconcile has succeeded at least once this session. */
   fresh: boolean;
@@ -97,6 +102,13 @@ async function idbSet(key: string, val: unknown): Promise<void> {
 // ---- in-memory store + subscriptions -------------------------------------
 let snapshot: CatalogSnapshot | null = null;
 let loading: Promise<CatalogSnapshot> | null = null;
+/** The background reconcile in flight, if any — see refreshFromNetwork(). */
+let refreshing: Promise<void> | null = null;
+/**
+ * Fingerprint of the payload the current snapshot was built from, so an
+ * unchanged catalogue can be recognised without rebuilding or re-rendering it.
+ */
+let signature = "";
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -143,13 +155,77 @@ export function getSnapshot(): CatalogSnapshot | null {
   return snapshot;
 }
 
+/**
+ * Cheap content fingerprint. Row count plus each variant's id and its own
+ * updated_at — the column the view already maintains — so any add, edit, price
+ * change, barcode assignment or stock movement changes it, and nothing else
+ * does. Comparing this is a few hundred microseconds against the tens of
+ * milliseconds a rebuild-and-re-render costs.
+ */
+function signatureOf(items: CatalogItem[]): string {
+  let s = `${items.length}`;
+  for (const it of items) s += `|${it.variant_id}:${it.updated_at}:${it.available}`;
+  return s;
+}
+
+/**
+ * Reconcile with the server.
+ *
+ * SINGLE FLIGHT, AND WHY IT MATTERS ON A TILL
+ * -------------------------------------------
+ * The refresh triggers are an interval, window focus, visibilitychange and
+ * `online`. Returning to the till fires focus AND visibilitychange together,
+ * and neither one updates `fetchedAt` until its own fetch RESOLVES, so the old
+ * code started a second and third identical request while the first was still
+ * in the air — each of which then rebuilt the index and re-rendered the screen.
+ *
+ * NO WORK WHEN NOTHING CHANGED
+ * ----------------------------
+ * The catalogue is usually identical to the copy already held: this runs every
+ * 60 seconds whether or not the shop touched anything. Rebuilding the maps and
+ * emitting anyway handed React a brand-new snapshot object every minute, which
+ * invalidated every useMemo on the POS screen and re-rendered its product grid
+ * — over two thousand cards, unvirtualised — for no change at all.
+ *
+ * That re-render is what broke scanning. It blocks the main thread for long
+ * enough that the keystrokes of a barcode already in flight queue up behind it,
+ * and a burst delivered in one clump after a stall used to read as a stale
+ * sequence followed by a fresh one: the leading digits were dropped and the
+ * remainder was billed as a whole code. The detector no longer measures time
+ * that way (see useHardwareScanner's stampOf), so this is now the second line
+ * of defence rather than the only one — but not doing the work is still the
+ * better fix, and it keeps a till responsive besides.
+ */
 async function refreshFromNetwork(): Promise<void> {
-  const res = await fetch("/api/catalog", { cache: "no-store" });
-  if (!res.ok) throw new Error(`catalog ${res.status}`);
-  const data = (await res.json()) as { items: CatalogItem[] };
-  snapshot = build(data.items ?? [], Date.now(), true);
-  emit();
-  await idbSet(KEY, { items: data.items ?? [], fetchedAt: snapshot.fetchedAt });
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    try {
+      const res = await fetch("/api/catalog", { cache: "no-store" });
+      if (!res.ok) throw new Error(`catalog ${res.status}`);
+      const data = (await res.json()) as { items: CatalogItem[] };
+      const items = data.items ?? [];
+      const sig = signatureOf(items);
+      if (snapshot && sig === signature) {
+        // Same catalogue. Mark it checked so the next tick does not re-fetch,
+        // and leave the snapshot object — and therefore the screen — alone.
+        //
+        // Updated IN PLACE, deliberately. useSyncExternalStore compares what
+        // getSnapshot() returns on every render, so handing back a new object
+        // would re-render the till anyway, which is the cost this branch exists
+        // to avoid. Neither field is rendered; both only drive staleness.
+        snapshot.fetchedAt = Date.now();
+        snapshot.fresh = true;
+        return;
+      }
+      signature = sig;
+      snapshot = build(items, Date.now(), true);
+      emit();
+      await idbSet(KEY, { items, fetchedAt: snapshot.fetchedAt });
+    } finally {
+      refreshing = null;
+    }
+  })();
+  return refreshing;
 }
 
 /**
@@ -169,6 +245,7 @@ export async function ensureCatalog(opts?: { force?: boolean }): Promise<Catalog
     if (!snapshot) {
       const cached = await idbGet<{ items: CatalogItem[]; fetchedAt: number }>(KEY);
       if (cached?.items?.length) {
+        signature = signatureOf(cached.items);
         snapshot = build(cached.items, cached.fetchedAt, false);
         emit();
       }
