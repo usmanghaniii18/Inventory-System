@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@hamza/shared/supabase/server";
 import { AppShell } from "@/components/layout/AppShell";
+import { UpdateBanner } from "@/components/layout/UpdateBanner";
 import type { Role } from "@/components/layout/nav";
 
 export default async function AdminLayout({
@@ -43,6 +44,8 @@ export default async function AdminLayout({
 
   return (
     <AppShell role={role} userName={fullName} unreadCount={unread} storeName={storeName} logoUrl={logoUrl}>
+      {/* Warns when this tab is older than the deployed server. See UpdateBanner. */}
+      <UpdateBanner />
       {children}
     </AppShell>
   );

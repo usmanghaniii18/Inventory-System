@@ -263,8 +263,12 @@ export function code128Svg(text: string, opts: Code128Opts = {}): string {
   const widths = code128Pattern(text);
   const totalModules = widths.reduce((a, b) => a + b, 0);
   const w = totalModules * moduleWidth + margin * 2;
-  const textH = showText ? (unit === "mm" ? moduleWidth * 8 : 16) : 0;
-  const h = height + textH + margin;
+  const fsFor = unit === "mm" ? moduleWidth * 6 : 13;
+  // Baseline sits at margin + height + fs; reserve a descender past it rather
+  // than a second full quiet-zone margin, which is what used to be added and
+  // cost several millimetres of bar height on a small label.
+  const textH = showText ? fsFor * 1.35 : 0;
+  const h = margin + height + textH;
 
   let x = margin;
   let bar = true; // patterns start with a bar
@@ -275,7 +279,7 @@ export function code128Svg(text: string, opts: Code128Opts = {}): string {
     x += px;
     bar = !bar;
   }
-  const fs = unit === "mm" ? moduleWidth * 6 : 13;
+  const fs = fsFor;
   const label = showText
     ? `<text x="${w / 2}" y="${margin + height + fs}" font-family="monospace" font-size="${fs}" text-anchor="middle" fill="${color}">${text}</text>`
     : "";
@@ -345,7 +349,15 @@ export function ean13Svg(code: string, opts: Ean13Opts = {}): string {
   const textH = showText ? (unit === "mm" ? X * 7 : Math.max(10, X * 7)) : 0;
   const padTop = 2 * X;
   const w = QZ_LEFT + bits.length * X + QZ_RIGHT;
-  const h = padTop + height + guardDrop + (showText ? textH * 0.35 : 0) + (showText ? 4 : 0);
+  // Space below the guard bars for the digit row. The `textH * 0.35` term
+  // already covers the descender: the baseline sits at padTop + height +
+  // guardDrop - 0.5X, so the glyphs reach only ~0.1X past the guard bars while
+  // this reserves 2.45X. The trailing constant that used to be added here was
+  // written for pixels and was being applied VERBATIM in millimetre mode, where
+  // it silently ate 4mm off every printed label - about a quarter of the bar
+  // height available on a 50x30mm sticker. It is kept for the px preview, where
+  // 4px is what it always meant, and dropped for mm.
+  const h = padTop + height + guardDrop + (showText ? textH * 0.35 : 0) + (showText && unit !== "mm" ? 4 : 0);
 
   // Guard-bar module positions (start 0-2, centre 45-49, end 92-94) run deeper.
   const isGuard = (i: number) => (i >= 0 && i <= 2) || (i >= 45 && i <= 49) || (i >= 92 && i <= 94);

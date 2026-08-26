@@ -8,10 +8,12 @@ import { Input, Label } from "@hamza/shared/ui/Input";
 import { Select } from "@hamza/shared/ui/Select";
 import { useToast } from "@hamza/shared/ui/Toast";
 import {
-  barcodeSvg, labelWidthMm, symbologyOf,
-  EAN13_MODULE_MM, CODE128_MODULE_MM, LABEL_BAR_HEIGHT_MM, LABEL_DPI,
+  barcodeSvg, symbologyOf,
 } from "@/lib/barcode";
-import { labelDocument, LABEL_W_MM, LABEL_H_MM, type LabelStock } from "@/lib/label-print";
+import {
+  labelDocument, fitLabel, STOCK, DEFAULT_DPI,
+  type LabelStock, type LabelDpi,
+} from "@/lib/label-print";
 import { ensureCatalog } from "@/lib/catalog-cache";
 import { assignInternalBarcode } from "./actions";
 
@@ -38,7 +40,10 @@ export function LabelDialog({
   const toast = useToast();
   const [barcode, setBarcode] = useState<string | null>(null);
   const [copies, setCopies] = useState("12");
-  const [stock, setStock] = useState<LabelStock>("sheet");
+  // The shop prints on the standard 50 x 30mm roll. 2x2 stays selectable for
+  // anyone who has the larger stock, but it is not what comes up by default.
+  const [stock, setStock] = useState<LabelStock>("roll");
+  const [dpi, setDpi] = useState<LabelDpi>(DEFAULT_DPI);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -49,7 +54,9 @@ export function LabelDialog({
   if (!target) return null;
   const sub = target.label && target.label !== "Default" ? ` · ${target.label}` : "";
   const symbology = barcode ? symbologyOf(barcode) : null;
-  const moduleMm = barcode && symbology === "EAN-13" ? EAN13_MODULE_MM : CODE128_MODULE_MM;
+  // Geometry is computed from the stock and the print head, not hard-coded, so
+  // choosing a bigger label or a finer printer actually makes the symbol bigger.
+  const fit = barcode ? fitLabel(barcode, stock, dpi) : null;
 
   async function generate() {
     if (!target) return;
@@ -76,6 +83,7 @@ export function LabelDialog({
       code: barcode,
       copies: Number(copies) || 1,
       stock,
+      dpi,
       title: target.sku,
     }));
     w.document.close();
@@ -110,12 +118,22 @@ export function LabelDialog({
               <div className="w-full [&_svg]:mx-auto" dangerouslySetInnerHTML={{ __html: barcodeSvg(barcode, { height: 52, moduleWidth: 2, showText: true }) }} />
             </div>
             <p className="rounded-lg bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-text-tertiary">
-              <strong className="text-text-secondary">{symbology}</strong> · module {moduleMm.toFixed(3)}mm
-              ({Math.round(moduleMm / (25.4 / LABEL_DPI))} dots @ {LABEL_DPI}dpi) · symbol {labelWidthMm(barcode).toFixed(1)}mm wide
-              incl. quiet zones · bars {LABEL_BAR_HEIGHT_MM}mm.
+              <strong className="text-text-secondary">{symbology}</strong> · module {fit!.moduleMm.toFixed(3)}mm
+              ({fit!.dots} dots @ {dpi}dpi) · symbol {fit!.symbolWidthMm.toFixed(1)}mm wide
+              incl. quiet zones · bars {fit!.barHeightMm}mm · centred in a {fit!.targetWidthMm}mm
+              box (the same on every label) on {STOCK[stock].widthMm}×{STOCK[stock].heightMm}mm stock.
               Print at <strong className="text-text-secondary">100% scale</strong> (no “fit to page”) so these
               dimensions survive to the paper.
             </p>
+            {fit!.tooWide && (
+              <p className="rounded-lg bg-coral-tile px-3 py-2 text-[11px] leading-relaxed text-coral-text">
+                <strong>This code is too long for the label.</strong> It is printing at the
+                narrowest module a {dpi}dpi head can resolve ({fit!.moduleMm.toFixed(3)}mm) and still
+                comes to {fit!.symbolWidthMm.toFixed(1)}mm, past the {fit!.targetWidthMm}mm the sticker allows.
+                It will scan, but it overhangs and will not line up with your other labels.
+                Use a shorter code, or the larger stock.
+              </p>
+            )}
           </>
         ) : (
           <div className="space-y-3 rounded-xl border border-dashed border-border p-4 text-center">
@@ -142,8 +160,16 @@ export function LabelDialog({
             <div className="flex-1">
               <Label>Label stock</Label>
               <Select value={stock} onChange={(e) => setStock(e.target.value as LabelStock)}>
-                <option value="sheet">A4 sheet (many per page)</option>
-                <option value="roll">Label roll ({LABEL_W_MM}×{LABEL_H_MM}mm, one per label)</option>
+                {(Object.keys(STOCK) as LabelStock[]).map((k) => (
+                  <option key={k} value={k}>{STOCK[k].label}</option>
+                ))}
+              </Select>
+            </div>
+            <div>
+              <Label>Printer</Label>
+              <Select value={String(dpi)} onChange={(e) => setDpi(Number(e.target.value) as LabelDpi)}>
+                <option value="203">203 dpi</option>
+                <option value="300">300 dpi</option>
               </Select>
             </div>
           </div>
