@@ -10,7 +10,8 @@
 import { describe, it, expect } from "vitest";
 import {
   labelHtml, labelDocument, labelPageCss, fitLabel, symbolModules,
-  nameCharsPerLine, STOCK, MAX_SKU_LENGTH, type LabelStock,
+  nameCharsPerLine, STOCK, MAX_SKU_LENGTH, DEFAULT_DPI, fittedBarcodeSvg,
+  type LabelStock,
 } from "./label-print";
 import { formatPKR } from "@hamza/shared/utils";
 import { isValidEan13 } from "./barcode";
@@ -260,5 +261,112 @@ describe("a code too long for the stock is reported, not silently shrunk", () =>
 
   it("a 13-digit EAN-13 — the normal worst case — fits comfortably", () => {
     expect(fitLabel("2900000010024", "roll").tooWide).toBe(false);
+  });
+});
+
+/**
+ * The physical output, measured off the rendered SVG rather than trusted from
+ * the fitting maths.
+ *
+ * A label that "passes its own tests" while printing wrong is exactly what was
+ * suspected when the shop's printed codes stopped scanning, so these assertions
+ * deliberately do not reuse fitLabel's arithmetic: they read the bar rectangles
+ * out of the finished symbol and measure the white space either side of them.
+ * (The scanning fault turned out to be in the wedge detector, not here — see
+ * useHardwareScanner.regression.test.ts — and these exist so that conclusion
+ * stays checkable.)
+ */
+describe("the printed symbol, measured off the rendered SVG", () => {
+  /** Left and right quiet zones, in modules, as actually drawn. */
+  function quietZones(svg: string, moduleMm: number) {
+    const vb = /viewBox="0 0 ([\d.]+) ([\d.]+)"/.exec(svg);
+    const width = Number(vb![1]);
+    // The first rect is the white background; the bars are the rest.
+    const bars = [...svg.matchAll(/<rect x="([\d.]+)"[^>]*width="([\d.]+)"/g)]
+      .map((m) => ({ x: Number(m[1]), w: Number(m[2]) }));
+    const first = Math.min(...bars.map((b) => b.x));
+    const last = Math.max(...bars.map((b) => b.x + b.w));
+    return { left: first / moduleMm, right: (width - last) / moduleMm, width, bars };
+  }
+
+  // Real codes from the live catalogue, across the length spread the shop
+  // actually prints — including the 6-digit sticker the client photographed.
+  const LIVE = [
+    "M", "3DX", "411", "25717", "258256", "2586700",
+    "29000000", "2900000010024", "8961100001019", "PARTYPOPPER",
+  ];
+
+  for (const dpi of [203, 300] as const) {
+    describe(`on the 50 x 30mm roll at ${dpi}dpi`, () => {
+      it("every module is a WHOLE number of printer dots", () => {
+        const dotMm = 25.4 / dpi;
+        for (const code of LIVE) {
+          const f = fitLabel(code, "roll", dpi);
+          const dots = f.moduleMm / dotMm;
+          expect(Math.abs(dots - Math.round(dots)), `${code}: ${dots} dots`).toBeLessThan(1e-9);
+          expect(f.dots).toBeGreaterThanOrEqual(2); // GS1 X-dimension floor
+        }
+      });
+
+      it("both quiet zones are to spec — the centring never eats one side", () => {
+        for (const code of LIVE) {
+          const f = fitLabel(code, "roll", dpi);
+          const qz = quietZones(fittedBarcodeSvg(code, f), f.moduleMm);
+          // EAN-13: 11X left / 7X right (ISO/IEC 15420). Code-128: 10X both.
+          const [minL, minR] = isValidEan13(code) ? [11, 7] : [10, 10];
+          // The svg's width attribute is written to 3 decimal places, so the
+          // right-hand zone measures up to a thousandth of a millimetre short of
+          // nominal. A hundredth of a MODULE of slack absorbs that and nothing
+          // else: at the narrowest module here it is under half a micrometre,
+          // while a real centring fault would cost whole modules.
+          const ROUNDING = 0.01;
+          expect(qz.left, `${code} left quiet zone`).toBeGreaterThanOrEqual(minL - ROUNDING);
+          expect(qz.right, `${code} right quiet zone`).toBeGreaterThanOrEqual(minR - ROUNDING);
+        }
+      });
+
+      it("the drawn width matches the fitted width, and fits the box", () => {
+        for (const code of LIVE) {
+          const f = fitLabel(code, "roll", dpi);
+          const qz = quietZones(fittedBarcodeSvg(code, f), f.moduleMm);
+          expect(qz.width).toBeCloseTo(f.symbolWidthMm, 2);
+          expect(f.tooWide, `${code} should fit the box`).toBe(false);
+          expect(f.symbolWidthMm).toBeLessThanOrEqual(f.targetWidthMm + 1e-9);
+        }
+      });
+
+      it("the symbol never overhangs the physical edge of the sticker", () => {
+        for (const code of LIVE) {
+          const f = fitLabel(code, "roll", dpi);
+          expect(f.symbolWidthMm, `${code}`).toBeLessThanOrEqual(STOCK.roll.widthMm);
+        }
+      });
+
+      it("bars stay tall enough for a hand-held sweep", () => {
+        for (const code of LIVE) {
+          expect(fitLabel(code, "roll", dpi).barHeightMm, `${code}`).toBeGreaterThanOrEqual(10);
+        }
+      });
+
+      it("the SVG carries explicit millimetre units, so nothing prints at px scale", () => {
+        for (const code of LIVE) {
+          const svg = fittedBarcodeSvg(code, fitLabel(code, "roll", dpi));
+          expect(svg, code).toMatch(/<svg[^>]*width="[\d.]+mm"[^>]*height="[\d.]+mm"/);
+        }
+      });
+    });
+  }
+
+  it("the dialog's default DPI is the one the roll is laid out for", () => {
+    expect(DEFAULT_DPI).toBe(203);
+  });
+
+  it("every code length the shop can generate fits the roll", () => {
+    // Digits only: this is the range internal/shelf codes are drawn from.
+    for (let len = 1; len <= 13; len++) {
+      const f = fitLabel("1".repeat(len), "roll", DEFAULT_DPI);
+      expect(f.tooWide, `${len} digits`).toBe(false);
+      expect(f.dots, `${len} digits`).toBeGreaterThanOrEqual(2);
+    }
   });
 });
