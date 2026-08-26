@@ -40,7 +40,9 @@ export function LabelDialog({
   const toast = useToast();
   const [barcode, setBarcode] = useState<string | null>(null);
   const [copies, setCopies] = useState("12");
-  const [stock, setStock] = useState<LabelStock>("2x2");
+  // The shop prints on the standard 50 x 30mm roll. 2x2 stays selectable for
+  // anyone who has the larger stock, but it is not what comes up by default.
+  const [stock, setStock] = useState<LabelStock>("roll");
   const [dpi, setDpi] = useState<LabelDpi>(DEFAULT_DPI);
   const [busy, setBusy] = useState(false);
 
@@ -118,10 +120,20 @@ export function LabelDialog({
             <p className="rounded-lg bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-text-tertiary">
               <strong className="text-text-secondary">{symbology}</strong> · module {fit!.moduleMm.toFixed(3)}mm
               ({fit!.dots} dots @ {dpi}dpi) · symbol {fit!.symbolWidthMm.toFixed(1)}mm wide
-              incl. quiet zones · bars {fit!.barHeightMm}mm on a {STOCK[stock].widthMm}×{STOCK[stock].heightMm}mm label.
+              incl. quiet zones · bars {fit!.barHeightMm}mm · centred in a {fit!.targetWidthMm}mm
+              box (the same on every label) on {STOCK[stock].widthMm}×{STOCK[stock].heightMm}mm stock.
               Print at <strong className="text-text-secondary">100% scale</strong> (no “fit to page”) so these
               dimensions survive to the paper.
             </p>
+            {fit!.tooWide && (
+              <p className="rounded-lg bg-coral-tile px-3 py-2 text-[11px] leading-relaxed text-coral-text">
+                <strong>This code is too long for the label.</strong> It is printing at the
+                narrowest module a {dpi}dpi head can resolve ({fit!.moduleMm.toFixed(3)}mm) and still
+                comes to {fit!.symbolWidthMm.toFixed(1)}mm, past the {fit!.targetWidthMm}mm the sticker allows.
+                It will scan, but it overhangs and will not line up with your other labels.
+                Use a shorter code, or the larger stock.
+              </p>
+            )}
           </>
         ) : (
           <div className="space-y-3 rounded-xl border border-dashed border-border p-4 text-center">

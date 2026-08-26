@@ -27,6 +27,13 @@ const STOCKS: LabelStock[] = ["sheet", "roll", "2x2"];
 const MONEY_MARKERS = [formatPKR(250), "PKR", "Rs", "Rs.", "₨", 'class="pr"', ".pr{"];
 
 const fit2x2 = fitLabel(CODE, "2x2");
+const fitRoll = fitLabel(CODE, "roll");
+
+/** A real spread of the shop's live code lengths, 1 char to 13 digits. */
+const REAL_CODES = [
+  "M", "AB", "3DX", "411", "604B", "LINER",
+  "BREMOD30", "GRO-SUG-1", "PARTYPOPPER", "2900000010024", "2900000010192",
+];
 
 describe("no price, ever", () => {
   it("is absent from one label", () => {
@@ -42,10 +49,17 @@ describe("no price, ever", () => {
   });
 
   it("carries nothing beyond the name and the symbol", () => {
-    const text = labelHtml("Cooking Oil", CODE, fit2x2)
+    // Strip the symbol and the name; what remains must be the two wrappers and
+    // nothing else — a price row would show up here as extra markup or a digit.
+    const rest = labelHtml("Cooking Oil", CODE, fit2x2)
       .replace(/<svg[\s\S]*<\/svg>/, "")
       .replace("Cooking Oil", "");
-    expect(text).toBe('<div class="lbl"><div class="nm"></div></div>');
+    expect(rest).toBe(
+      '<div class="lbl"><div class="nm"></div>' +
+      `<div class="bc" style="width:${fit2x2.targetWidthMm}mm"></div></div>`,
+    );
+    // the only number left is the box width, which is geometry, not content
+    expect(rest.replace(`width:${fit2x2.targetWidthMm}mm`, "")).not.toMatch(/\d/);
   });
 
   it("escapes a name containing markup", () => {
@@ -89,9 +103,14 @@ describe("the symbol is as large as the stock allows", () => {
     expect(at300.symbolWidthMm).toBeGreaterThanOrEqual(at203.symbolWidthMm);
   });
 
-  it("the 2x2 stock is a real improvement over the 50x30 roll", () => {
-    const roll = fitLabel(CODE, "roll");
-    expect(fit2x2.barHeightMm).toBeGreaterThan(roll.barHeightMm);
+  it("the 2x2 stock still has more room than the 50x30 roll", () => {
+    expect(fit2x2.barHeightMm).toBeGreaterThan(fitRoll.barHeightMm);
+  });
+
+  it("the roll stock's bars are far taller than the 11.2mm they used to be", () => {
+    // Two changes bought this: the pixel constant that was being applied as
+    // millimetres in the renderer, and dropping the name block to two lines.
+    expect(fitRoll.barHeightMm).toBeGreaterThan(15);
   });
 
   it("counts quiet zones inside the symbol width", () => {
@@ -169,5 +188,77 @@ describe("SKU length limit for the 2x2 label", () => {
     const b = labelDocument({ name: `X · ${"A".repeat(MAX_SKU_LENGTH)}`, code: CODE, copies: 1, stock: "2x2", title: "L" });
     const svgOf = (d: string) => /<svg[\s\S]*?<\/svg>/.exec(d)?.[0] ?? "";
     expect(svgOf(a)).toBe(svgOf(b));
+  });
+});
+
+
+describe("every barcode occupies the same width, whatever it encodes", () => {
+  it("gives every code an identical box on the roll stock", () => {
+    const boxes = new Set(REAL_CODES.map((c) => fitLabel(c, "roll").targetWidthMm));
+    expect(boxes.size).toBe(1);
+    expect([...boxes][0]).toBe(48); // 50mm stock less 1mm of edge each side
+  });
+
+  it("renders that box at a fixed width in the markup", () => {
+    const widths = new Set(
+      REAL_CODES.map((c) => {
+        const doc = labelDocument({ name: "X", code: c, copies: 1, stock: "roll", title: "X" });
+        return /<div class="bc" style="width:([\d.]+)mm"/.exec(doc)?.[1];
+      }),
+    );
+    expect(widths.size).toBe(1);
+    expect([...widths][0]).toBe("48");
+  });
+
+  it("keeps every symbol inside that box", () => {
+    for (const c of REAL_CODES) {
+      const f = fitLabel(c, "roll");
+      expect(f.tooWide).toBe(false);
+      expect(f.symbolWidthMm).toBeLessThanOrEqual(f.targetWidthMm);
+    }
+  });
+
+  it("never prints a module below the 203dpi safe minimum", () => {
+    // 2 dots = 0.250mm, the GS1 X-dimension floor for Code-128.
+    for (const c of REAL_CODES) {
+      const f = fitLabel(c, "roll");
+      expect(f.dots).toBeGreaterThanOrEqual(2);
+      expect(f.moduleMm).toBeGreaterThanOrEqual(25.4 / 203 * 2 - 1e-9);
+    }
+  });
+
+  it("keeps every module a whole number of dots across the whole spread", () => {
+    for (const c of REAL_CODES) {
+      const f = fitLabel(c, "roll");
+      const ratio = f.moduleMm / (25.4 / 203);
+      expect(ratio).toBeCloseTo(Math.round(ratio), 9);
+    }
+  });
+
+  it("centres the symbol in the box rather than stretching it", () => {
+    const doc = labelDocument({ name: "X", code: "AB", copies: 1, stock: "roll", title: "X" });
+    expect(doc).toContain("justify-content:center");
+    // the symbol itself must never be resized to fill the box
+    expect(doc).toContain("width:auto!important");
+  });
+});
+
+describe("a code too long for the stock is reported, not silently shrunk", () => {
+  const longest = "A".repeat(MAX_SKU_LENGTH);
+
+  it("flags it instead of going under the safe module width", () => {
+    const f = fitLabel(longest, "roll");
+    expect(f.tooWide).toBe(true);
+    expect(f.dots).toBe(2);                       // pinned at the floor, not below
+    expect(f.symbolWidthMm).toBeGreaterThan(f.targetWidthMm);
+  });
+
+  it("still prints in full rather than being clipped to look like a shorter code", () => {
+    const doc = labelDocument({ name: "X", code: longest, copies: 1, stock: "roll", title: "X" });
+    expect(doc).toContain("overflow:visible");
+  });
+
+  it("a 13-digit EAN-13 — the normal worst case — fits comfortably", () => {
+    expect(fitLabel("2900000010024", "roll").tooWide).toBe(false);
   });
 });
