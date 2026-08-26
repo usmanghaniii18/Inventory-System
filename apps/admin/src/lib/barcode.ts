@@ -72,18 +72,60 @@ export function parseScan(raw: string): ParsedScan {
   return { raw, barcode: code, lookupKey: code, isWeightEmbedded: false };
 }
 
+/**
+ * Does this text look like MACHINE input (a scanned or hand-typed code) rather
+ * than a product search?
+ *
+ * Used at the till to decide whether a term that matched no barcode is a failed
+ * scan (report it) or a search (fuzzy-match it). Three or more bare digits is
+ * the line: nobody searches the catalogue by typing bare digits, while every
+ * barcode — and every FRAGMENT of one left behind by a half-read scan — is
+ * exactly that. Getting this wrong in the permissive direction is what let a
+ * fragment resolve to an unrelated product and bill it.
+ */
+export function looksLikeCode(text: string): boolean {
+  return /^\d{3,}$/.test(text.trim());
+}
+
 function pad(n: number | string, len: number) {
   return String(n).replace(/\D/g, "").padStart(len, "0").slice(-len);
 }
 
-/** Plain internal EAN-13 (prefix "29") for an item with no manufacturer code. */
+/** Widest sequence value {@link generateWeightTemplateEan13} can encode safely. */
+export const MAX_WEIGHT_ITEM_REF = 99_999;
+
+/** Widest sequence value {@link generateInternalEan13} can encode safely. */
+export const MAX_INTERNAL_SEQ = 9_999_999_999;
+
+/**
+ * Plain internal EAN-13 (prefix "29") for an item with no manufacturer code.
+ * Guarded against the same 10-digit truncation-into-collision as the weight
+ * template above — see {@link generateWeightTemplateEan13}.
+ */
 export function generateInternalEan13(seq: number, prefix = "29"): string {
+  if (!Number.isInteger(seq) || seq < 0 || seq > MAX_INTERNAL_SEQ) {
+    throw new RangeError(`internal barcode seq ${seq} does not fit the 10-digit field`);
+  }
   const d12 = `${prefix}${pad(seq, 10)}`;
   return d12 + ean13Check(d12);
 }
 
-/** Weight-template EAN-13 (value field zeroed) to store on a variable-weight variant. */
+/**
+ * Weight-template EAN-13 (value field zeroed) to store on a variable-weight
+ * variant.
+ *
+ * The item ref field is only 5 digits wide, and `pad` truncates to the LAST 5 —
+ * so a sequence value above 99999 used to silently wrap and mint a code already
+ * assigned to another product. The DB's unique constraint would then reject the
+ * insert, the caller swallowed the error, and the item shipped with no barcode
+ * at all. Throwing here surfaces the exhaustion instead of corrupting the range.
+ */
 export function generateWeightTemplateEan13(itemRef: number, prefix = WEIGHT_PREFIXES[0]): string {
+  if (!Number.isInteger(itemRef) || itemRef < 0 || itemRef > MAX_WEIGHT_ITEM_REF) {
+    throw new RangeError(
+      `weight item ref ${itemRef} does not fit the 5-digit field (0-${MAX_WEIGHT_ITEM_REF})`,
+    );
+  }
   const d12 = `${prefix}${pad(itemRef, 5)}00000`;
   return d12 + ean13Check(d12);
 }

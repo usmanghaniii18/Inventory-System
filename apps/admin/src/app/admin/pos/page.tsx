@@ -22,7 +22,7 @@ export default async function PosPage() {
   const [{ data: catalog }, { data: catIds }, { data: customers }, { data: categories }, { data: settings }, { data: promoRows }, user] = await Promise.all([
     supabase
       .from("catalog_index")
-      .select("variant_id, product_id, product_name, has_variants, sku, label, barcode, price, avg_cost, cost, disc_type, disc_value, reorder_point, category_id, available, image_url, unit")
+      .select("variant_id, product_id, product_name, has_variants, sku, label, barcode, barcodes, price, avg_cost, cost, disc_type, disc_value, reorder_point, category_id, available, image_url, unit")
       .eq("active", true)
       .order("product_name")
       .limit(POS_GRID_LIMIT),
@@ -61,6 +61,7 @@ export default async function PosPage() {
     label: v.has_variants ? v.label : "",
     sku: v.sku,
     barcode: v.barcode,
+    barcodes: (v.barcodes as string[] | null) ?? null,
     price: Number(v.price),
     cost: Number(v.avg_cost) || Number(v.cost),
     disc_type: (v.disc_type as "PERCENT" | "FIXED" | null) ?? null,
@@ -81,8 +82,16 @@ export default async function PosPage() {
     .map((c) => ({ id: c.id, name: c.parent_id ? `${catName.get(c.parent_id) ?? ""} › ${c.name}` : c.name }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  // First-paint scan index: every code on each variant, not just the primary,
+  // so a scan resolves correctly before the client catalogue cache hydrates.
   const barcodeIndex: Record<string, string> = {};
-  for (const v of items) if (v.barcode) barcodeIndex[v.barcode] = v.variant_id;
+  for (const v of items) {
+    const codes = v.barcodes?.length ? v.barcodes : v.barcode ? [v.barcode] : [];
+    for (const raw of codes) {
+      const code = (raw ?? "").trim();
+      if (code) barcodeIndex[code] = v.variant_id;
+    }
+  }
 
   return (
     <PosClient

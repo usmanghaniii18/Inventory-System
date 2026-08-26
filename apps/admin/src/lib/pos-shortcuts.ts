@@ -33,12 +33,31 @@
  * F2, F4, F8 and F9. F3 and F6 are no longer bound to an action; pressing
  * either produces a one-line hint pointing at its replacement, for anyone who
  * learned the old keys.
+ *
+ * THE BILL-DISCOUNT KEY
+ * ---------------------
+ * F9 was the obvious candidate and is NOT available: it already charges an
+ * uncharged cart as cash and prints it. Rebinding a money-moving key to open a
+ * discount box is not a trade worth making, so the whole-bill discount takes
+ * F7 — the next free function key, and the only one left whose reservation is
+ * confined to a single browser (Firefox's caret browsing; Chrome and Edge,
+ * which the till runs, leave it alone).
+ *
+ * Because no F-key is completely safe, "%" is bound to the same action as a
+ * mnemonic second route. Printable keys are resolved in the BUBBLE phase (see
+ * isCharacterKey below), so it stays behind the hardware scanner's shield and
+ * cannot be triggered by a character inside a scanned barcode, and it is
+ * guarded like +/- so it can still be typed into a non-empty search term.
  */
 
 export type PosAction =
   | "focusScan"
   | "editLine"
   | "checkout"
+  /** F7 or % — focus the whole-bill discount box next to the total. */
+  | "billDiscount"
+  /** Escape inside that box — remove the bill discount and go back to scanning. */
+  | "cancelBillDiscount"
   /** F9 — charge an uncharged cart as cash and print, else print/reprint. */
   | "print"
   /** Ctrl+P — print/reprint ONLY. Never charges. */
@@ -57,6 +76,16 @@ export type PosAction =
 export interface ShortcutContext {
   /** Focus is inside a cart line's quantity/discount editor. */
   inCartEdit: boolean;
+  /**
+   * Focus is in the whole-bill discount box.
+   *
+   * This has to be known here, not left to the input's own onKeyDown: the
+   * shortcut listener runs in the CAPTURE phase, so it sees Escape first and
+   * stopPropagation() downstream cannot take it back. Without this flag,
+   * pressing Escape in the discount box resolved to "clearOrCancel" and
+   * WIPED THE ENTIRE SALE.
+   */
+  inBillDiscount: boolean;
   /** Focus is in any text field (input / textarea / select / contenteditable). */
   inField: boolean;
   /** The scan/search box is empty, so +/- may act on the product grid. */
@@ -80,7 +109,7 @@ export interface KeyLike {
 
 /** Actions that must not auto-repeat when a key is held down. */
 const NO_REPEAT: ReadonlySet<PosAction> = new Set<PosAction>([
-  "focusScan", "editLine", "checkout", "print", "printOnly",
+  "focusScan", "editLine", "checkout", "billDiscount", "cancelBillDiscount", "print", "printOnly",
   "clearOrCancel", "toggleHelp", "legacyEditHint", "legacyPrintHint",
 ]);
 
@@ -111,6 +140,15 @@ function classify(e: KeyLike, ctx: ShortcutContext): PosAction | null {
     if (!isFunctionKey(e.key)) return null;
   }
 
+  // Same ownership rule for the whole-bill discount box: while the cashier is
+  // typing an amount into it, every ordinary key belongs to it — including the
+  // "%" and "+/-" that are shortcuts everywhere else. Escape means "drop this
+  // discount", never "clear the sale".
+  if (ctx.inBillDiscount) {
+    if (e.key === "Escape") return "cancelBillDiscount";
+    if (!isFunctionKey(e.key)) return null;
+  }
+
   // ---- Modifier combinations -------------------------------------------
   const mod = e.ctrlKey || e.metaKey;
   if (mod && !e.altKey) {
@@ -131,6 +169,7 @@ function classify(e: KeyLike, ctx: ShortcutContext): PosAction | null {
   switch (e.key) {
     case "F2": return "focusScan";
     case "F4": return "checkout";
+    case "F7": return "billDiscount";
     case "F8": return "editLine";
     case "F9": return "print";
     // Retired because the browser claims them (find next / cycle panes).
@@ -144,6 +183,10 @@ function classify(e: KeyLike, ctx: ShortcutContext): PosAction | null {
   // Numpad * — the traditional "quantity" key on retail tills. Guarded like
   // +/- so it can still be typed into a non-empty search term.
   if (e.code === "NumpadMultiply" && (!ctx.inField || ctx.searchEmpty)) return "editLine";
+
+  // Mnemonic second route to the bill discount, for keyboards whose F-keys sit
+  // behind an Fn toggle. Guarded like +/- so it can still be typed in a search.
+  if (e.key === "%" && (!ctx.inField || ctx.searchEmpty)) return "billDiscount";
 
   if (e.key === "?" && !ctx.inField) return "toggleHelp";
   if (e.key === "ArrowDown" || e.key === "ArrowRight") return "moveNext";
@@ -183,6 +226,7 @@ export function isCharacterKey(e: KeyLike): boolean {
 export const SHORTCUT_HELP: { keys: string; label: string }[] = [
   { keys: "F2", label: "Focus the scan / search box" },
   { keys: "F8", label: "Edit quantity + discount of the current line" },
+  { keys: "F7  (or %)", label: "Discount the whole bill" },
   { keys: "F4", label: "Checkout — pick udhaar / JazzCash / Easypaisa / split" },
   { keys: "F9", label: "Charge as Cash + print — or reprint the last bill" },
   { keys: "Enter", label: "Quantity → Discount → back to scanning" },

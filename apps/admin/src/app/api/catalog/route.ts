@@ -3,7 +3,7 @@ import { createClient } from "@hamza/shared/supabase/server";
 import { fetchAll } from "@/lib/fetch-all";
 
 // The lightweight catalogue index: one row per sellable variant with name,
-// option label, primary barcode, price, cost and live stock. The client caches
+// option label, EVERY barcode on the variant, price, cost and live stock. The client caches
 // this (in-memory + IndexedDB) so scans and search resolve instantly and keep
 // working through brief network drops — see src/lib/catalog-cache.ts.
 export const dynamic = "force-dynamic";
@@ -22,7 +22,7 @@ export async function GET() {
     data = await fetchAll((from, to) => supabase
       .from("catalog_index")
       .select(
-        "variant_id, product_id, product_name, brand, has_variants, is_variable_weight, sku, label, barcode, price, cost, disc_type, disc_value, reorder_point, category_id, image_url, unit, available, avg_cost, active, updated_at",
+        "variant_id, product_id, product_name, brand, has_variants, is_variable_weight, sku, label, barcode, barcodes, price, cost, disc_type, disc_value, reorder_point, category_id, image_url, unit, available, avg_cost, active, updated_at",
       )
       .eq("active", true)
       .order("product_name").order("variant_id").range(from, to));

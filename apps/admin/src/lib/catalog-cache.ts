@@ -15,7 +15,15 @@ export interface CatalogItem {
   is_variable_weight: boolean;
   sku: string;
   label: string;
+  /** Primary barcode — what the label printer stamps and the UI shows. */
   barcode: string | null;
+  /**
+   * EVERY barcode on this variant (manufacturer EAN, internal sticker, any
+   * alternates), primary first. The scan index is built from this: keying only
+   * off `barcode` meant a product with a second code simply would not scan on
+   * it — one of the "barcode doesn't scan" reports.
+   */
+  barcodes?: string[] | null;
   price: number;
   cost: number;
   /** Product's default discount (auto-filled in the POS cart). */
@@ -98,9 +106,30 @@ function emit() {
 function build(items: CatalogItem[], fetchedAt: number, fresh: boolean): CatalogSnapshot {
   const byBarcode = new Map<string, CatalogItem>();
   const byVariant = new Map<string, CatalogItem>();
+  const conflicts: string[] = [];
   for (const it of items) {
     byVariant.set(it.variant_id, it);
-    if (it.barcode) byBarcode.set(it.barcode, it);
+    // Index every code the variant carries, not just the primary one.
+    const codes = it.barcodes?.length ? it.barcodes : it.barcode ? [it.barcode] : [];
+    for (const raw of codes) {
+      const code = (raw ?? "").trim();
+      if (!code) continue;
+      const prev = byBarcode.get(code);
+      // The DB has a UNIQUE constraint on product_barcodes.barcode, so this is
+      // unreachable in a healthy database. If it ever fires, the code is
+      // genuinely ambiguous and must resolve to NOTHING rather than to whichever
+      // row happened to be indexed last — a wrong item on a bill is worse than
+      // a refused scan. scripts/barcode-audit.mjs reports these.
+      if (prev && prev.variant_id !== it.variant_id) {
+        conflicts.push(code);
+        continue;
+      }
+      byBarcode.set(code, it);
+    }
+  }
+  for (const code of conflicts) byBarcode.delete(code);
+  if (conflicts.length && typeof console !== "undefined") {
+    console.error("[catalog] duplicate barcodes ignored — run scripts/barcode-audit.mjs", conflicts);
   }
   return { items, byBarcode, byVariant, fetchedAt, fresh };
 }
@@ -177,12 +206,34 @@ export function lookupBarcodeLoose(code: string): CatalogItem | null {
     if (hit) return hit;
   }
   if (/^\d+$/.test(trimmed)) {
+    // Zero-padding tolerance, but only when UNAMBIGUOUS. Returning the first
+    // hit could resolve a scan to a different product than the one on the
+    // sticker whenever two codes differ only by leading zeros.
     const bare = trimmed.replace(/^0+/, "") || "0";
+    let hit: CatalogItem | null = null;
     for (const [bc, item] of snapshot.byBarcode) {
-      if (/^\d+$/.test(bc) && (bc.replace(/^0+/, "") || "0") === bare) return item;
+      if (!/^\d+$/.test(bc) || (bc.replace(/^0+/, "") || "0") !== bare) continue;
+      if (hit && hit.variant_id !== item.variant_id) return null; // ambiguous
+      hit = item;
     }
+    return hit;
   }
   return null;
+}
+
+/**
+ * Is this string EXACTLY a barcode in the catalogue?
+ *
+ * Exact equality against the scan index — no prefix, substring, zero-padding
+ * or fuzzy fallback of any kind. The wedge detector uses it to decide whether
+ * a burst too short to judge on timing alone is a real scan, so anything
+ * looser here would hand that decision back to guesswork.
+ *
+ * Ambiguous codes are already absent from the index (build() drops any code
+ * claimed by two variants), so a duplicate can never answer true.
+ */
+export function isKnownBarcode(code: string): boolean {
+  return !!snapshot && !!code && snapshot.byBarcode.has(code);
 }
 
 export function lookupByVariant(variantId: string): CatalogItem | null {
@@ -200,7 +251,7 @@ export function searchCatalog(q: string, limit = 50): CatalogItem[] {
       it.product_name.toLowerCase().includes(t) ||
       it.label.toLowerCase().includes(t) ||
       it.sku.toLowerCase().includes(t) ||
-      (it.barcode ?? "").includes(t)
+      (it.barcodes?.length ? it.barcodes : [it.barcode ?? ""]).some((b) => (b ?? "").includes(t))
     ) {
       out.push(it);
       if (out.length >= limit) break;

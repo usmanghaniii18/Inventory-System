@@ -334,7 +334,7 @@ export function ProductsClient({
               onEditVariant={(v) => setEditVariant(v)}
               onLabel={(v) => setLabelTarget({
                 variant_id: v.id, product_id: p.id, name: p.name, label: v.label,
-                sku: v.sku, sale_price: v.sale_price, barcode: v.barcode,
+                sku: v.sku, barcode: v.barcode,
                 is_variable_weight: p.is_variable_weight,
               })}
               onImageChanged={refreshList}
