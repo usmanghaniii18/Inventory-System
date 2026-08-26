@@ -30,8 +30,41 @@ import { useScanHandler } from "@/components/scan/ScanProvider";
 import { CategoryMultiSelect } from "@/components/CategoryMultiSelect";
 import { expandCategorySelection } from "@/lib/categories";
 import { parseScan } from "@/lib/barcode";
+import { MAX_SKU_LENGTH } from "@hamza/shared/validation";
 import { ensureCatalog, lookupBarcodeLoose } from "@/lib/catalog-cache";
 import { beepOk, beepError } from "@/lib/sound";
+
+/**
+ * The SKU reaches the printed shelf label: a variant with no option values
+ * falls back to its SKU for its label, and the label prints
+ * "<product name> · <label>". Past MAX_SKU_LENGTH it eats the name block and,
+ * on a fixed-height die-cut label, gets CLIPPED — and a clipped SKU on a shelf
+ * is indistinguishable from a different SKU. So it is refused at entry rather
+ * than silently truncated. See lib/label-print.ts for where the number is
+ * derived from the label geometry.
+ */
+function skuTooLong(sku: string): string {
+  return `SKU is ${sku.trim().length} characters — the printed label fits ${MAX_SKU_LENGTH}. Shorten it so the sticker stays readable.`;
+}
+
+/** Live character budget under a SKU field; turns a warning colour near the cap. */
+function SkuHint({ value, id }: { value: string; id?: string }) {
+  const n = value.trim().length;
+  if (!n) return null;
+  const over = n > MAX_SKU_LENGTH;
+  const near = !over && n > MAX_SKU_LENGTH - 4;
+  return (
+    <p
+      id={id}
+      className={cn(
+        "mt-1 text-[11px]",
+        over ? "font-medium text-coral-text" : near ? "text-amber-600" : "text-text-tertiary",
+      )}
+    >
+      {over ? skuTooLong(value) : `${n}/${MAX_SKU_LENGTH} characters — fits the printed label`}
+    </p>
+  );
+}
 
 export type { ProductRow, VariantRow };
 
@@ -632,6 +665,7 @@ function VariantEditDrawer({
     e.preventDefault();
     if (!variant) return;
     if (!form.sku.trim()) return onError("SKU is required.");
+    if (form.sku.trim().length > MAX_SKU_LENGTH) return onError(skuTooLong(form.sku));
     setSaving(true);
     // Cost is intentionally NOT sent here — it changes only through purchases or
     // the audited "Correct cost price" action (see CorrectCostDialog).
@@ -667,7 +701,13 @@ function VariantEditDrawer({
         <div className="grid grid-cols-2 gap-3">
           <div>
             <Label>SKU *</Label>
-            <Input value={form.sku} onChange={(e) => setForm((f) => ({ ...f, sku: e.target.value }))} />
+            <Input
+              value={form.sku}
+              onChange={(e) => setForm((f) => ({ ...f, sku: e.target.value }))}
+              maxLength={MAX_SKU_LENGTH}
+              aria-describedby="sku-limit"
+            />
+            <SkuHint id="sku-limit" value={form.sku} />
           </div>
           <div>
             <Label className="flex items-center gap-1.5"><Barcode className="h-3.5 w-3.5" /> Barcode</Label>
@@ -1207,7 +1247,13 @@ function AddProductDrawer({
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <Label>Product code (SKU) *</Label>
-                  <Input value={single.sku} onChange={(e) => setSingle((s) => ({ ...s, sku: e.target.value }))} placeholder="GFT-BOX-02" />
+                  <Input
+                    value={single.sku}
+                    onChange={(e) => setSingle((s) => ({ ...s, sku: e.target.value }))}
+                    placeholder="GFT-BOX-02"
+                    maxLength={MAX_SKU_LENGTH}
+                  />
+                  <SkuHint value={single.sku} />
                 </div>
                 <div>
                   <Label className="flex items-center gap-1.5"><Barcode className="h-3.5 w-3.5" /> Barcode</Label>
@@ -1227,7 +1273,15 @@ function AddProductDrawer({
               </div>
               <div>
                 <Label>Base SKU</Label>
-                <Input value={base.base_sku} onChange={(e) => setBase((b) => ({ ...b, base_sku: e.target.value }))} placeholder="COS-LIP" />
+                <Input
+                  value={base.base_sku}
+                  onChange={(e) => setBase((b) => ({ ...b, base_sku: e.target.value }))}
+                  placeholder="COS-LIP"
+                  // Generated variant SKUs append "-1", "-2", ... so the base
+                  // must leave room for the suffix or every row it makes is
+                  // over the label limit.
+                  maxLength={MAX_SKU_LENGTH - 4}
+                />
               </div>
             </div>
             <Help>Each generated variant starts from these, then you fine-tune per row below.</Help>
@@ -1282,7 +1336,15 @@ function AddProductDrawer({
                     {matrix.map((m, i) => (
                       <tr key={i} className="border-b border-border/60 last:border-0">
                         <td className="whitespace-nowrap px-2 py-1.5 font-medium text-text-primary">{m.combo.join(" / ")}</td>
-                        <td className="px-2 py-1.5"><Input value={m.sku} onChange={(e) => setMatrixField(i, "sku", e.target.value)} className="h-7 w-24 text-xs" /></td>
+                        <td className="px-2 py-1.5">
+                          <Input
+                            value={m.sku}
+                            onChange={(e) => setMatrixField(i, "sku", e.target.value)}
+                            maxLength={MAX_SKU_LENGTH}
+                            className={cn("h-7 w-24 text-xs", m.sku.trim().length > MAX_SKU_LENGTH && "border-coral-text")}
+                            title={m.sku.trim().length > MAX_SKU_LENGTH ? skuTooLong(m.sku) : undefined}
+                          />
+                        </td>
                         <td className="px-2 py-1.5"><Input data-scan-input value={m.barcode} onChange={(e) => setMatrixField(i, "barcode", e.target.value)} className="h-7 w-28 text-xs" /></td>
                         <td className="px-2 py-1.5"><Input type="number" value={m.sale_price} onChange={(e) => setMatrixField(i, "sale_price", e.target.value)} className="h-7 w-16 text-xs" /></td>
                         <td className="px-2 py-1.5"><Input type="number" value={m.cost} onChange={(e) => setMatrixField(i, "cost", e.target.value)} className="h-7 w-16 text-xs" /></td>

@@ -1,5 +1,21 @@
 import { z } from "zod";
 
+/**
+ * Longest SKU that still prints cleanly on a 2x2 inch shelf label.
+ *
+ * A variant with no option values falls back to its SKU for its label, and the
+ * label prints "<product name> — <label>" — so an over-long SKU eats into the
+ * name block, and on a fixed-height die-cut label whatever overflows is
+ * CLIPPED. A clipped SKU on a shelf is indistinguishable from a different SKU,
+ * which is why this is refused at entry rather than silently truncated.
+ *
+ * Derived in apps/admin/src/lib/label-print.ts, where the geometry lives and a
+ * test asserts this value still fits one line at the largest name font any
+ * stock uses. Duplicated as a literal here only because packages/shared cannot
+ * import from an app.
+ */
+export const MAX_SKU_LENGTH = 24;
+
 /** Human-readable first validation error (with field path when present). */
 export function firstIssue(err: z.ZodError): string {
   const i = err.issues[0];
@@ -98,7 +114,8 @@ export const productInputSchema = z.object({
   has_variants: z.boolean(),
   options: z.array(z.object({ name: z.string(), values: z.array(z.string()) })),
   variants: z.array(z.object({
-    sku: z.string().trim().min(1, "SKU is required."),
+    sku: z.string().trim().min(1, "SKU is required.")
+      .max(MAX_SKU_LENGTH, `SKU must be ${MAX_SKU_LENGTH} characters or fewer so it fits the printed label.`),
     barcode: z.string().nullable().optional(),
     sale_price: money,
     cost: money,
