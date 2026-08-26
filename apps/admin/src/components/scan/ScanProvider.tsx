@@ -10,10 +10,14 @@ import { ScanActionSheet } from "./ScanActionSheet";
 import { CameraScanner } from "./CameraScannerLazy";
 
 type Handler = (code: string) => void;
+/** Called when a scan was detected but could not be read whole. */
+type PartialHandler = (fragment: string) => void;
 
 interface ScanCtx {
   /** Register a screen-local scan handler; pass null to release. */
   register: (h: Handler | null) => void;
+  /** Register a screen-local half-read-scan handler; pass null to release. */
+  registerPartial: (h: PartialHandler | null) => void;
   /** Open the global camera scanner. */
   openCamera: () => void;
 }
@@ -28,6 +32,7 @@ const Ctx = createContext<ScanCtx | null>(null);
  */
 export function ScanProvider({ children }: { children: React.ReactNode }) {
   const handlerRef = useRef<Handler | null>(null);
+  const partialRef = useRef<PartialHandler | null>(null);
   const [item, setItem] = useState<CatalogItem | null>(null);
   const [unknown, setUnknown] = useState<string | null>(null);
   const [cameraOpen, setCameraOpen] = useState(false);
@@ -62,13 +67,26 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     else resolveGlobal(code);
   }, [resolveGlobal]);
 
-  useHardwareScanner(onScan);
+  /**
+   * A burst that was clearly a scan but could not be read as one whole code.
+   * It is reported — never guessed at — so the cashier re-scans instead of a
+   * fragment silently resolving to some other product.
+   */
+  const onPartial = useCallback((fragment: string) => {
+    if (partialRef.current) { partialRef.current(fragment); return; }
+    beepError();
+    setItem(null);
+    setUnknown(fragment ? `${fragment}…` : "(unreadable scan)");
+  }, []);
+
+  useHardwareScanner(onScan, { onPartial });
 
   const register = useCallback((h: Handler | null) => { handlerRef.current = h; }, []);
+  const registerPartial = useCallback((h: PartialHandler | null) => { partialRef.current = h; }, []);
   const openCamera = useCallback(() => setCameraOpen(true), []);
 
   return (
-    <Ctx.Provider value={{ register, openCamera }}>
+    <Ctx.Provider value={{ register, registerPartial, openCamera }}>
       {children}
       <ScannerIndicator lastScan={lastScan} />
       <ScanActionSheet item={item} unknown={unknown} onClose={() => { setItem(null); setUnknown(null); }} />
@@ -117,14 +135,25 @@ export function useScan(): ScanCtx {
  * Register a screen-local scan handler for as long as the component is mounted.
  * While registered, the global "scan anywhere" sheet is suppressed.
  */
-export function useScanHandler(handler: Handler, enabled = true) {
-  const { register } = useScan();
+export function useScanHandler(
+  handler: Handler,
+  enabled = true,
+  onPartial?: PartialHandler,
+) {
+  const { register, registerPartial } = useScan();
   const ref = useRef(handler);
   ref.current = handler;
+  const partialRef = useRef(onPartial);
+  partialRef.current = onPartial;
+  // `onPartial` itself is read through the ref on every call, so only whether
+  // the screen supplies one at all needs to re-run the registration.
+  const wantsPartial = !!onPartial;
   useEffect(() => {
     if (!enabled) return;
     const stable: Handler = (code) => ref.current(code);
+    const stablePartial: PartialHandler = (f) => partialRef.current?.(f);
     register(stable);
-    return () => register(null);
-  }, [register, enabled]);
+    registerPartial(wantsPartial ? stablePartial : null);
+    return () => { register(null); registerPartial(null); };
+  }, [register, registerPartial, enabled, wantsPartial]);
 }

@@ -17,7 +17,7 @@ import { cn, formatPKR } from "@hamza/shared/utils";
 import { useCatalog } from "@/lib/useCatalog";
 import { ensureCatalog, type CatalogItem } from "@/lib/catalog-cache";
 import { useScanHandler } from "@/components/scan/ScanProvider";
-import { parseScan } from "@/lib/barcode";
+import { parseScan, looksLikeCode } from "@/lib/barcode";
 import { beepOk, beepError } from "@/lib/sound";
 import { CameraScanner } from "@/components/scan/CameraScannerLazy";
 import { PaymentSheet } from "./PaymentSheet";
@@ -99,7 +99,10 @@ export interface PosProduct {
   name: string;
   label: string;
   sku: string;
+  /** Primary barcode — what the label shows. */
   barcode: string | null;
+  /** Every barcode on this variant (primary first); the scan index uses them all. */
+  barcodes?: string[] | null;
   price: number;
   cost: number;
   /** Product's default discount — auto-filled per cart line (editable). */
@@ -114,6 +117,12 @@ export interface PosProduct {
   unit: string | null;
 }
 
+/** Every barcode a product answers to, primary first, blanks dropped. */
+function codesOf(p: PosProduct): string[] {
+  const raw = p.barcodes?.length ? p.barcodes : p.barcode ? [p.barcode] : [];
+  return raw.map((c) => (c ?? "").trim()).filter(Boolean);
+}
+
 function tone(p: PosProduct) { return p.available <= 0 ? "out_of_stock" : p.available <= (p.reorder_point || 5) ? "low_stock" : "in_stock"; }
 
 function toPos(it: CatalogItem): PosProduct {
@@ -124,6 +133,7 @@ function toPos(it: CatalogItem): PosProduct {
     label: it.has_variants ? it.label : "",
     sku: it.sku,
     barcode: it.barcode,
+    barcodes: it.barcodes ?? null,
     price: it.price,
     cost: it.avg_cost || it.cost,
     disc_type: it.disc_type ?? null,
@@ -171,7 +181,17 @@ export function PosClient({
   const barcodeIndex = useMemo(() => {
     if (!snap) return initialBarcodeIndex;
     const m: Record<string, string> = {};
-    for (const it of snap.items) if (it.barcode) m[it.barcode] = it.variant_id;
+    const clash = new Set<string>();
+    for (const it of snap.items) {
+      const codes = it.barcodes?.length ? it.barcodes : it.barcode ? [it.barcode] : [];
+      for (const raw of codes) {
+        const code = (raw ?? "").trim();
+        if (!code) continue;
+        if (m[code] && m[code] !== it.variant_id) { clash.add(code); continue; }
+        m[code] = it.variant_id;
+      }
+    }
+    for (const c of clash) delete m[c];
     return m;
   }, [snap, initialBarcodeIndex]);
   const [q, setQ] = useState("");
@@ -254,9 +274,22 @@ export function PosClient({
     return () => { window.removeEventListener("resize", measure); ro?.disconnect(); };
   }, []);
   const byId = useMemo(() => new Map(products.map((p) => [p.variant_id, p])), [products]);
+  // Every code of every product, not just the primary one — a product carrying
+  // both a manufacturer EAN and an internal sticker must scan on either. A code
+  // claimed by two different variants (impossible while the DB's UNIQUE holds)
+  // is dropped rather than resolved arbitrarily: refusing a scan is safe,
+  // billing the wrong item is not.
   const byBarcode = useMemo(() => {
     const m = new Map<string, PosProduct>();
-    for (const p of products) if (p.barcode) m.set(p.barcode, p);
+    const clash = new Set<string>();
+    for (const p of products) {
+      for (const code of codesOf(p)) {
+        const prev = m.get(code);
+        if (prev && prev.variant_id !== p.variant_id) { clash.add(code); continue; }
+        m.set(code, p);
+      }
+    }
+    for (const c of clash) m.delete(c);
     return m;
   }, [products]);
 
@@ -271,7 +304,7 @@ export function PosClient({
     return products.filter((p) => {
       if (cat && p.category_id !== cat) return false;
       if (!t) return true;
-      return p.name.toLowerCase().includes(t) || p.label.toLowerCase().includes(t) || p.sku.toLowerCase().includes(t) || (p.barcode ?? "").includes(t);
+      return p.name.toLowerCase().includes(t) || p.label.toLowerCase().includes(t) || p.sku.toLowerCase().includes(t) || codesOf(p).some((c) => c.includes(t));
     });
   }, [products, q, cat]);
 
@@ -424,11 +457,21 @@ export function PosClient({
   /** Resolve a code against the barcode indexes (tolerant of leading zeros). */
   function findByBarcode(raw: string): { p?: PosProduct; parsed: ReturnType<typeof parseScan> } {
     const parsed = parseScan(raw);
+    // Leading-zero tolerance, but only when it is UNAMBIGUOUS. Returning the
+    // first map hit (as this did) could hand back a different product than the
+    // one scanned whenever two codes differ only by zero-padding — at the till
+    // that is a wrong item on the bill, so an ambiguous match resolves to
+    // nothing and the cashier is told the code was not recognised.
     const looseBarcode = (code: string): PosProduct | undefined => {
       if (!/^\d+$/.test(code)) return undefined;
       const bare = code.replace(/^0+/, "") || "0";
-      for (const [bc, prod] of byBarcode) if (/^\d+$/.test(bc) && (bc.replace(/^0+/, "") || "0") === bare) return prod;
-      return undefined;
+      let hit: PosProduct | undefined;
+      for (const [bc, prod] of byBarcode) {
+        if (!/^\d+$/.test(bc) || (bc.replace(/^0+/, "") || "0") !== bare) continue;
+        if (hit && hit.variant_id !== prod.variant_id) return undefined; // ambiguous
+        hit = prod;
+      }
+      return hit;
     };
     const p =
       byBarcode.get(parsed.lookupKey) ||
@@ -446,10 +489,14 @@ export function PosClient({
   function handleScan(raw: string) {
     const { p, parsed } = findByBarcode(raw);
     if (!p) {
-      // still allow an unambiguous text match (e.g. a typed SKU)
+      // Fall back only to an EXACT sku/barcode match. This used to be a
+      // SUBSTRING match over name/sku/barcode, so a partially-read code (a few
+      // digits of a 13-digit barcode) would substring-match some unrelated
+      // product and, if it happened to match only one, bill it. Machine input
+      // is now matched exactly or reported — never guessed at.
       const t = raw.trim().toLowerCase();
       const matches = products.filter(
-        (x) => x.name.toLowerCase().includes(t) || x.sku.toLowerCase().includes(t) || (x.barcode ?? "").includes(t),
+        (x) => x.sku.toLowerCase() === t || codesOf(x).some((c) => c.toLowerCase() === t),
       );
       if (matches.length === 1) { addResolved(matches[0]); return; }
       beepError();
@@ -481,8 +528,29 @@ export function PosClient({
     if (byCode) { handleScan(term); return; }
 
     const t = term.toLowerCase();
+
+    // An EXACT sku/name match is always safe to take, whatever the term looks
+    // like — it keeps a hand-typed numeric SKU working past the guard below.
+    const exactTyped = products.filter((x) => x.sku.toLowerCase() === t || x.name.toLowerCase() === t);
+    if (exactTyped.length === 1) { addResolved(exactTyped[0]); return; }
+
+    // A term that LOOKS like a scanned code and matched nothing exactly is a
+    // FAILED SCAN, not a search. Falling through to the fuzzy pick below (which
+    // ends at `pool[0]`) is what billed an arbitrary product whenever a jittery
+    // wedge left a fragment of a barcode in this box — the fragment substring-
+    // matched some unrelated 13-digit barcode and the first such product was
+    // added. See useHardwareScanner's abandon(). Machine-shaped input is now
+    // reported, never guessed at.
+    if (looksLikeCode(term)) {
+      beepError();
+      flash(false, `Unknown code: ${term} — scan again`);
+      setQ("");
+      focusScanSoon();
+      return;
+    }
+
     const pool = filtered.length ? filtered : products.filter(
-      (x) => x.name.toLowerCase().includes(t) || x.label.toLowerCase().includes(t) || x.sku.toLowerCase().includes(t) || (x.barcode ?? "").includes(t),
+      (x) => x.name.toLowerCase().includes(t) || x.label.toLowerCase().includes(t) || x.sku.toLowerCase().includes(t) || codesOf(x).some((c) => c.includes(t)),
     );
     if (!pool.length) {
       beepError();
@@ -490,7 +558,7 @@ export function PosClient({
       return;
     }
     const exact = pool.find((x) => x.sku.toLowerCase() === t || x.name.toLowerCase() === t);
-    const highlighted = filtered[highlight];
+    const highlighted = filtered[highlight];  // the card the cashier is looking at
     const starts = pool.find((x) => x.name.toLowerCase().startsWith(t));
     const pick = exact
       ?? (highlighted && pool.includes(highlighted) ? highlighted : undefined)
@@ -507,7 +575,18 @@ export function PosClient({
 
   // Own scans while POS is open (the global scan-anywhere sheet is suppressed).
   // Fires only when no field is focused, so it never double-counts the search box.
-  useScanHandler((code) => handleScan(code));
+  // The third argument handles a burst that WAS a scan but could not be read
+  // whole: the cashier is told to scan again, and nothing is added to the bill.
+  useScanHandler(
+    (code) => handleScan(code),
+    true,
+    () => {
+      setQ("");
+      beepError();
+      flash(false, "Scan not read — scan again");
+      focusScanSoon();
+    },
+  );
 
   const lines = [...cart.values()];
   // Promotions (time-bound sales / category offers) layered on top of each

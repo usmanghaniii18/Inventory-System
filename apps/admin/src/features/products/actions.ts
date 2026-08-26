@@ -158,22 +158,33 @@ async function ensureVariantBarcodes(
   const missing = ids.filter((id) => !have.has(id));
   if (!missing.length) return;
 
-  const rows: { product_id: string; variant_id: string; barcode: string; type: string; is_primary: boolean }[] = [];
+  // One INSERT per variant, retried past a collision.
+  //
+  // This used to build every row and insert them as a single statement whose
+  // error was discarded. Postgres rejects the WHOLE statement on one unique
+  // violation, so a single colliding code left EVERY variant of the product
+  // with no barcode at all — silently. That is one of the ways items reached
+  // the till with a sticker that scanned as nothing. Per-row inserts mean one
+  // bad draw can only ever cost the variant it belongs to, and the retry draws
+  // a fresh sequence value instead of giving up.
   for (const variantId of missing) {
-    const { data: seq, error } = await db.rpc("next_internal_barcode");
-    if (error) return; // sequence unavailable — leave it to the Label dialog
-    const n = Number(seq);
-    rows.push({
-      product_id: productId,
-      variant_id: variantId,
-      barcode: variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n),
-      type: "INTERNAL",
-      is_primary: true,
-    });
+    for (let attempt = 0; attempt < BARCODE_ASSIGN_RETRIES; attempt++) {
+      const { data: seq, error: seqErr } = await db.rpc("next_internal_barcode");
+      if (seqErr) return; // sequence unavailable — leave it to the Label dialog
+      let barcode: string;
+      try {
+        const n = Number(seq);
+        barcode = variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n);
+      } catch {
+        return; // sequence has outgrown the code format — the Label dialog reports it
+      }
+      const { error } = await db.from("product_barcodes").insert({
+        product_id: productId, variant_id: variantId, barcode, type: "INTERNAL", is_primary: true,
+      });
+      if (!error) break;
+      if (!isUniqueViolation(error)) break; // a real failure — a barcode is never worth failing the product over
+    }
   }
-  // Ignore a unique-violation here: a barcode is a convenience, never a reason
-  // to fail a product the user has already successfully created.
-  await db.from("product_barcodes").insert(rows);
 }
 
 /**
@@ -524,6 +535,17 @@ export async function importProducts(rows: ParsedProductRow[]) {
   return { ok: true as const, created, skipped: rows.length - created };
 }
 
+/** How many fresh sequence values to try before giving up on a collision. */
+const BARCODE_ASSIGN_RETRIES = 5;
+
+/** Is this a Postgres unique-constraint violation (23505)? */
+function isUniqueViolation(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false;
+  if (error.code === "23505") return true;
+  const m = (error.message ?? "").toLowerCase();
+  return m.includes("duplicate key") || m.includes("unique constraint");
+}
+
 /**
  * Ensure a variant has a scannable barcode. If it already has one, return it;
  * otherwise generate an internal GS1 prefix-2 EAN-13 (or a weight template for
@@ -542,21 +564,36 @@ export async function assignInternalBarcode(variantId: string, productId: string
     .maybeSingle();
   if (existing?.barcode) return { ok: true, barcode: existing.barcode as string, existed: true };
 
-  const { data: seq, error: seqErr } = await db.rpc("next_internal_barcode");
-  if (seqErr) return { error: seqErr.message };
-  const n = Number(seq);
-  const barcode = variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n);
-
-  const { error } = await db.from("product_barcodes").insert({
-    product_id: productId,
-    variant_id: variantId,
-    barcode,
-    type: "INTERNAL",
-    is_primary: true,
-  });
-  if (error) return { error: error.message };
-  revalidatePath("/admin/products");
-  return { ok: true, barcode, existed: false };
+  // Draw from the sequence and INSERT, letting the database's unique constraint
+  // — not a read-then-write check, which races two cashiers adding products at
+  // once — be the thing that decides the code is free. A collision just draws
+  // the next value.
+  let lastError = "Could not assign a barcode.";
+  for (let attempt = 0; attempt < BARCODE_ASSIGN_RETRIES; attempt++) {
+    const { data: seq, error: seqErr } = await db.rpc("next_internal_barcode");
+    if (seqErr) return { error: seqErr.message };
+    let barcode: string;
+    try {
+      const n = Number(seq);
+      barcode = variableWeight ? generateWeightTemplateEan13(n) : generateInternalEan13(n);
+    } catch (e) {
+      return { error: e instanceof RangeError ? e.message : "Could not generate a barcode." };
+    }
+    const { error } = await db.from("product_barcodes").insert({
+      product_id: productId,
+      variant_id: variantId,
+      barcode,
+      type: "INTERNAL",
+      is_primary: true,
+    });
+    if (!error) {
+      revalidatePath("/admin/products");
+      return { ok: true, barcode, existed: false };
+    }
+    lastError = error.message;
+    if (!isUniqueViolation(error)) break;
+  }
+  return { error: lastError };
 }
 
 // ---- Product image gallery -----------------------------------------------

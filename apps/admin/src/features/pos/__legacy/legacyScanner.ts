@@ -93,14 +93,6 @@ export interface ScanDetectorHost {
   /** Remove characters that leaked into the focused field before we were sure. */
   stripLeaked(leaked: string): void;
   onScan(code: string): void;
-  /**
-   * A burst that carried machine-speed keystrokes but could NOT be read as a
-   * whole code (jitter split it, or a stall wiped the buffer mid-scan). The
-   * partial characters have been cleaned out of the field and the terminating
-   * Enter swallowed, so nothing downstream can act on the fragment. The host
-   * should tell the cashier to scan again.
-   */
-  onPartial?(fragment: string): void;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(timer: unknown): void;
   debug?: boolean;
@@ -123,11 +115,6 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
   let firstTs = 0; // timestamp of the first char in the buffer
   let lastTs = 0; // timestamp of the most recent char
   let leaked = ""; // chars that landed in a focused field this burst
-  // True once a key in THIS burst arrived at machine speed. It is what tells a
-  // half-read scan apart from a person typing: a fragment left behind by a
-  // broken burst must never be allowed to reach a search box, whereas typed
-  // text must be left completely alone.
-  let sawMachineSpeed = false;
   let timer: unknown = null;
   let lastCode = "";
   let lastFlushAt = 0; // when the previous accepted burst ENDED
@@ -135,7 +122,6 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
   const reset = () => {
     buffer = "";
     leaked = "";
-    sawMachineSpeed = false;
     firstTs = 0;
     lastTs = 0;
     if (timer !== null) { host.clearTimer(timer); timer = null; }
@@ -148,34 +134,6 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     const mean = avgGap();
     if (mean <= AVG_GAP_MS) return true;
     return buffer.length >= SLOW_DIGIT_MIN_LENGTH && mean <= SLOW_DIGIT_GAP_MS && /^\d+$/.test(buffer);
-  };
-
-  /**
-   * Drop a burst we cannot read as a code, WITHOUT leaving debris behind.
-   *
-   * This is the fix for the wrong-product bug: previously a jittery wedge scan
-   * (some keys fast enough to be consumed, some slow enough to land in the
-   * field) was simply reset — leaving a random SUBSET of the barcode's digits
-   * sitting in the POS search box, and letting the scanner's Enter through to
-   * the box's submit handler, which then matched that fragment against the
-   * catalogue and billed an arbitrary product. Now the fragment is stripped and
-   * the caller is told, so the cashier is asked to scan again instead.
-   *
-   * Returns true when the burst was a real (broken) scan, meaning the caller
-   * must also swallow the terminating key.
-   */
-  const abandon = (): boolean => {
-    const fragment = leaked;
-    const wasScan = sawMachineSpeed && buffer.length > 1;
-    reset();
-    // Only ever touch the field when this really was a machine burst. A person
-    // typing produces no machine-speed keys, so their text is never disturbed —
-    // which is why the strip is gated on wasScan and not simply on `leaked`.
-    if (!wasScan) return false;
-    if (fragment) host.stripLeaked(fragment);
-    if (debug()) console.info("[scan] partial burst discarded", { fragment });
-    host.onPartial?.(fragment);
-    return true;
   };
 
   const flush = () => {
@@ -205,7 +163,7 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     timer = host.setTimer(() => {
       timer = null;
       if (looksLikeScan()) flush();
-      else abandon();
+      else reset();
     }, FLUSH_IDLE_MS);
   };
 
@@ -226,12 +184,7 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
         if (debug() && buffer.length >= MIN_SCAN_LENGTH) {
           console.info("[scan] ignored (looks like typing)", { buffer, len: buffer.length, avgGapMs: Math.round(avgGap()) });
         }
-        // A half-read scan must not fall through to the field's Enter handler
-        // with a fragment of the code still in it.
-        if (abandon()) {
-          e.preventDefault();
-          e.stopPropagation();
-        }
+        reset();
       }
       return;
     }
@@ -240,11 +193,9 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
 
     const gap = buffer === "" ? Infinity : now - lastTs;
     if (gap > NEW_SEQUENCE_GAP_MS) {
-      // Long pause → this is the start of a new sequence. If the sequence being
-      // abandoned was itself a machine burst, clean its characters out of the
-      // field first — otherwise a stall mid-scan silently leaves the first half
-      // of a barcode in the search box for the second half to be appended to.
-      abandon();
+      // Long pause → this is the start of a new sequence.
+      buffer = "";
+      leaked = "";
       firstTs = now;
     }
     if (buffer === "") firstTs = now;
@@ -252,7 +203,6 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
 
     const machineSpeed = buffer !== "" && gap <= CONSUME_GAP_MS;
     buffer += e.key;
-    if (machineSpeed) sawMachineSpeed = true;
     if (machineSpeed) {
       // Confident this is a scan in progress → keep it out of any focused field.
       e.preventDefault();
@@ -303,13 +253,11 @@ function stripLeakedFromDom(leaked: string) {
 
 export function useHardwareScanner(
   onScan: (code: string) => void,
-  opts: { enabled?: boolean; onPartial?: (fragment: string) => void } = {},
+  opts: { enabled?: boolean } = {},
 ) {
   const { enabled = true } = opts;
   const onScanRef = useRef(onScan);
   onScanRef.current = onScan;
-  const onPartialRef = useRef(opts.onPartial);
-  onPartialRef.current = opts.onPartial;
 
   useEffect(() => {
     if (!enabled) return;
@@ -323,7 +271,6 @@ export function useHardwareScanner(
       },
       stripLeaked: stripLeakedFromDom,
       onScan: (code) => onScanRef.current(code),
-      onPartial: (fragment) => onPartialRef.current?.(fragment),
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
     });
