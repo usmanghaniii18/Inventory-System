@@ -4,11 +4,14 @@ import {
   type ShortcutContext, type KeyLike,
 } from "./pos-shortcuts";
 
-const idle: ShortcutContext = { inCartEdit: false, inField: false, searchEmpty: true, anyModal: false };
-const typing: ShortcutContext = { inCartEdit: false, inField: true, searchEmpty: false, anyModal: false };
-const scanBox: ShortcutContext = { inCartEdit: false, inField: true, searchEmpty: true, anyModal: false };
-const editing: ShortcutContext = { inCartEdit: true, inField: true, searchEmpty: true, anyModal: false };
-const modal: ShortcutContext = { inCartEdit: false, inField: false, searchEmpty: true, anyModal: true };
+const base = { inCartEdit: false, inBillDiscount: false, inField: false, searchEmpty: true, anyModal: false };
+const idle: ShortcutContext = { ...base };
+const typing: ShortcutContext = { ...base, inField: true, searchEmpty: false };
+const scanBox: ShortcutContext = { ...base, inField: true };
+const editing: ShortcutContext = { ...base, inCartEdit: true, inField: true };
+const modal: ShortcutContext = { ...base, anyModal: true };
+/** Focus is in the whole-bill discount box. */
+const billBox: ShortcutContext = { ...base, inBillDiscount: true, inField: true };
 
 const k = (key: string, extra: Partial<KeyLike> = {}): KeyLike => ({ key, ...extra });
 
@@ -65,7 +68,13 @@ describe("keys the browser reserves are no longer bound", () => {
   });
 
   it("leaves reload / fullscreen / devtools entirely alone", () => {
-    for (const key of ["F1", "F5", "F7", "F10", "F11", "F12"]) {
+    // F7 used to be in this list. It is now bound to the whole-bill discount:
+    // every other function key was taken, and F9 — the obvious candidate — is
+    // the one that charges an uncharged cart as cash, which is not a key worth
+    // rebinding to open a discount box. F7's only claimant is Firefox (caret
+    // browsing); Chrome and Edge, which the till runs, leave it alone. "%" is
+    // bound to the same action as a second route for that reason.
+    for (const key of ["F1", "F5", "F10", "F11", "F12"]) {
       expect(resolveShortcut(k(key), idle)).toBeNull();
     }
   });
@@ -208,5 +217,59 @@ describe("listener-phase split — protects barcode scanning", () => {
     // Each hyphen would otherwise resolve to decQty and nudge the highlighted
     // product's quantity once per hyphen.
     for (const ch of "GRO-SUG-1") expect(isCharacterKey(k(ch))).toBe(true);
+  });
+});
+
+
+describe("whole-bill discount shortcut (Item C)", () => {
+  it("binds F7 — F9 was unavailable, it already charges the cart as cash", () => {
+    expect(resolveShortcut(k("F9"), idle)).toBe("print");
+    expect(resolveShortcut(k("F7"), idle)).toBe("billDiscount");
+  });
+
+  it("works from anywhere on the screen, exactly like F8", () => {
+    for (const ctx of [idle, typing, scanBox, editing]) {
+      expect(resolveShortcut(k("F7"), ctx)).toBe("billDiscount");
+      expect(resolveShortcut(k("F8"), ctx)).toBe("editLine");
+    }
+  });
+
+  it("accepts % as a mnemonic second route when the search box is not in use", () => {
+    expect(resolveShortcut(k("%"), idle)).toBe("billDiscount");
+    expect(resolveShortcut(k("%"), scanBox)).toBe("billDiscount");
+  });
+
+  it("lets % be typed into a search term rather than firing", () => {
+    expect(resolveShortcut(k("%"), typing)).toBeNull();
+  });
+
+  it("does not auto-repeat while the key is held", () => {
+    expect(resolveShortcut(k("F7", { repeat: true }), idle)).toBeNull();
+  });
+
+  it("stays out of the way while a modal owns the screen", () => {
+    expect(resolveShortcut(k("%"), modal)).toBeNull();
+  });
+});
+
+describe("Escape inside the bill-discount box must NOT clear the sale", () => {
+  it("resolves to cancelBillDiscount, not clearOrCancel", () => {
+    // The shortcut listener runs in the capture phase, so it sees Escape before
+    // the input's own onKeyDown: without the inBillDiscount flag this resolved
+    // to "clearOrCancel" and wiped the entire cart.
+    expect(resolveShortcut(k("Escape"), billBox)).toBe("cancelBillDiscount");
+    expect(resolveShortcut(k("Escape"), idle)).toBe("clearOrCancel");
+  });
+
+  it("gives the box every ordinary key while it is focused", () => {
+    for (const key of ["%", "+", "-", "5", "0", "."]) {
+      expect(resolveShortcut(k(key), billBox)).toBeNull();
+    }
+  });
+
+  it("still lets the function keys through", () => {
+    expect(resolveShortcut(k("F4"), billBox)).toBe("checkout");
+    expect(resolveShortcut(k("F8"), billBox)).toBe("editLine");
+    expect(resolveShortcut(k("F9"), billBox)).toBe("print");
   });
 });

@@ -8,11 +8,11 @@ import { Input, Label } from "@hamza/shared/ui/Input";
 import { Select } from "@hamza/shared/ui/Select";
 import { useToast } from "@hamza/shared/ui/Toast";
 import {
-  barcodeSvg, barcodeLabelSvg, labelWidthMm, symbologyOf,
+  barcodeSvg, labelWidthMm, symbologyOf,
   EAN13_MODULE_MM, CODE128_MODULE_MM, LABEL_BAR_HEIGHT_MM, LABEL_DPI,
 } from "@/lib/barcode";
+import { labelDocument, LABEL_W_MM, LABEL_H_MM, type LabelStock } from "@/lib/label-print";
 import { ensureCatalog } from "@/lib/catalog-cache";
-import { formatPKR } from "@hamza/shared/utils";
 import { assignInternalBarcode } from "./actions";
 
 export interface LabelTarget {
@@ -21,17 +21,9 @@ export interface LabelTarget {
   name: string;
   label: string;
   sku: string;
-  sale_price: number;
   barcode: string | null;
   is_variable_weight: boolean;
 }
-
-// Label stock. "roll" prints ONE label per page sized to the die-cut label (a
-// dedicated barcode/label printer); "sheet" lays labels out on A4 (the previous
-// behaviour, kept as the default so nothing regresses for existing users).
-type Stock = "sheet" | "roll";
-const LABEL_W_MM = 50;
-const LABEL_H_MM = 30;
 
 /** Generate (if needed) and print scanner-standard shelf labels for a variant. */
 export function LabelDialog({
@@ -46,7 +38,7 @@ export function LabelDialog({
   const toast = useToast();
   const [barcode, setBarcode] = useState<string | null>(null);
   const [copies, setCopies] = useState("12");
-  const [stock, setStock] = useState<Stock>("sheet");
+  const [stock, setStock] = useState<LabelStock>("sheet");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -73,50 +65,19 @@ export function LabelDialog({
     }
   }
 
-  function labelHtml(code: string) {
-    return (
-      `<div class="lbl">` +
-      `<div class="nm">${escapeHtml(target!.name + sub)}</div>` +
-      `<div class="pr">${escapeHtml(formatPKR(target!.sale_price))}</div>` +
-      // Rendered at an exact millimetre size. The symbol must NOT be scaled by
-      // the surrounding CSS box: squeezing it is what used to drop the module
-      // width below the minimum a scanner can resolve.
-      barcodeLabelSvg(code, LABEL_BAR_HEIGHT_MM) +
-      `</div>`
-    );
-  }
-
   function print() {
-    if (!barcode) return;
-    const n = Math.max(1, Math.min(200, Number(copies) || 1));
+    if (!barcode || !target) return;
     const w = window.open("", "_blank", "width=800,height=600");
     if (!w) return toast("Allow pop-ups to print labels", "error");
-
-    // One label per page on a roll; a flowed grid on an A4 sheet. Either way the
-    // barcode keeps its exact printed dimensions (width:auto, max-width:none).
-    const page = stock === "roll"
-      ? `@page{size:${LABEL_W_MM}mm ${LABEL_H_MM}mm;margin:0}` +
-        `.lbl{width:${LABEL_W_MM}mm;height:${LABEL_H_MM}mm;page-break-after:always;` +
-        `display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5mm;border:0}` +
-        `.grid{display:block}`
-      : `@page{size:A4;margin:8mm}` +
-        `.grid{display:flex;flex-wrap:wrap;gap:3mm}` +
-        `.lbl{width:${LABEL_W_MM}mm;border:0.2mm solid #eee;border-radius:1mm;padding:1.5mm;` +
-        `display:flex;flex-direction:column;align-items:center;gap:0.5mm;page-break-inside:avoid}`;
-
-    w.document.write(
-      `<html><head><title>Labels — ${escapeHtml(target!.sku)}</title><style>` +
-        `*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;margin:0;color:#000;background:#fff;` +
-        `-webkit-print-color-adjust:exact;print-color-adjust:exact}` +
-        page +
-        `.nm{font-size:2.4mm;font-weight:600;line-height:1.15;text-align:center;max-width:100%;` +
-        `overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}` +
-        `.pr{font-size:3.2mm;font-weight:700}` +
-        // Critical: never let the layout resize the symbol.
-        `svg{width:auto!important;max-width:none!important;height:auto!important;display:block}` +
-        `</style></head><body><div class="grid">${Array(n).fill(labelHtml(barcode)).join("")}</div>` +
-        `<script>window.onload=function(){window.print()}</script></body></html>`,
-    );
+    // Markup + stylesheet come from lib/label-print.ts, which is where the
+    // "name and barcode only, never a price" rule lives and is unit-tested.
+    w.document.write(labelDocument({
+      name: target.name + sub,
+      code: barcode,
+      copies: Number(copies) || 1,
+      stock,
+      title: target.sku,
+    }));
     w.document.close();
   }
 
@@ -142,10 +103,11 @@ export function LabelDialog({
 
         {barcode ? (
           <>
+            {/* Preview of the actual label: product name + symbol, no price. */}
             <div className="flex flex-col items-center gap-2 rounded-xl border border-border bg-white p-3">
+              <div className="max-w-full text-center text-sm font-semibold leading-tight text-black">{target.name}{sub}</div>
               {/* On-screen preview only — the printed symbol is sized in mm. */}
               <div className="w-full [&_svg]:mx-auto" dangerouslySetInnerHTML={{ __html: barcodeSvg(barcode, { height: 52, moduleWidth: 2, showText: true }) }} />
-              <div className="text-sm font-semibold text-text-primary">{formatPKR(target.sale_price)}</div>
             </div>
             <p className="rounded-lg bg-surface-2 px-3 py-2 text-[11px] leading-relaxed text-text-tertiary">
               <strong className="text-text-secondary">{symbology}</strong> · module {moduleMm.toFixed(3)}mm
@@ -179,7 +141,7 @@ export function LabelDialog({
             </div>
             <div className="flex-1">
               <Label>Label stock</Label>
-              <Select value={stock} onChange={(e) => setStock(e.target.value as Stock)}>
+              <Select value={stock} onChange={(e) => setStock(e.target.value as LabelStock)}>
                 <option value="sheet">A4 sheet (many per page)</option>
                 <option value="roll">Label roll ({LABEL_W_MM}×{LABEL_H_MM}mm, one per label)</option>
               </Select>
@@ -189,8 +151,4 @@ export function LabelDialog({
       </div>
     </Drawer>
   );
-}
-
-function escapeHtml(s: string) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }

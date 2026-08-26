@@ -18,6 +18,7 @@ import { useCatalog } from "@/lib/useCatalog";
 import { ensureCatalog, type CatalogItem } from "@/lib/catalog-cache";
 import { useScanHandler } from "@/components/scan/ScanProvider";
 import { parseScan, looksLikeCode } from "@/lib/barcode";
+import { resolveQtyEdit, resolveDiscountEdit, formatQty } from "@/lib/pos-line-edit";
 import { beepOk, beepError } from "@/lib/sound";
 import { CameraScanner } from "@/components/scan/CameraScannerLazy";
 import { PaymentSheet } from "./PaymentSheet";
@@ -215,6 +216,13 @@ export function PosClient({
     return null;
   }
   const [discount, setDiscount] = useState("");
+  // Bumped by the bill-discount shortcut. The totals panel is rendered twice
+  // (desktop column + mobile sheet) so the parent cannot hold the input's ref;
+  // it raises this counter instead and whichever copy is actually VISIBLE
+  // focuses itself — the same technique the qty/discount editor uses for the
+  // cart line. Reusing the on-screen input is what makes the shortcut and the
+  // mouse-click flow literally the same flow rather than two copies of it.
+  const [billDiscountFocus, setBillDiscountFocus] = useState(0);
   const [processing, setProcessing] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [paymentOpen, setPaymentOpen] = useState(false);
@@ -292,6 +300,19 @@ export function PosClient({
     for (const c of clash) m.delete(c);
     return m;
   }, [products]);
+
+  /**
+   * LIVE on-hand for a variant.
+   *
+   * A cart entry keeps the PosProduct it was added with and that snapshot is
+   * never refreshed — a sale resumed from Hold carries one restored out of
+   * localStorage, so it can be days old. Every stock decision therefore reads
+   * the current catalogue first and falls back to the entry's own copy only
+   * when the item has left the active catalogue entirely.
+   */
+  function availableOf(p: PosProduct): number {
+    return byId.get(p.variant_id)?.available ?? p.available;
+  }
 
   function flash(ok: boolean, text: string) {
     setLastScan({ ok, text });
@@ -404,31 +425,73 @@ export function PosClient({
     setEditing({ id: target, field: "qty" });
   }
 
-  /** Apply the typed quantity and advance to this same line's discount. */
+  /**
+   * Apply the typed quantity and advance to this same line's discount.
+   *
+   * The decision lives in resolveQtyEdit() (see lib/pos-line-edit.ts). What is
+   * accepted here is EXACTLY what was typed: a quantity beyond stock is refused
+   * and reported, and the editor stays on the quantity box so it can be
+   * corrected — it is never quietly reduced to the stock figure and billed,
+   * which is what used to happen.
+   */
   function commitQty() {
     if (!editing) return;
     const entry = cart.get(editing.id);
     if (!entry) return focusScan();
-    const raw = qtyDraft.trim();
-    const n = raw === "" ? entry.qty : Number(raw);
-    if (!Number.isFinite(n) || n < 0) { beepError(); return; }
-    if (n <= 0) { setQty(editing.id, 0); beepOk(); return focusScan(); } // 0 removes the line
-    // Clamp to what's actually on hand so checkout can't fail on stock later.
-    const capped = Math.min(n, entry.p.available);
-    if (capped < n) flash(false, `Only ${entry.p.available} of ${entry.p.name} in stock`);
-    setQty(editing.id, capped);
-    setQtyDraft(String(capped));
-    setEditing({ id: editing.id, field: "disc" });
+
+    const res = resolveQtyEdit(qtyDraft, entry.qty, availableOf(entry.p));
+    switch (res.kind) {
+      case "invalid":
+        beepError();
+        flash(false, "Enter a quantity of 0 or more");
+        return; // stay on the quantity box
+      case "overstock":
+        beepError();
+        flash(false, `Only ${formatQty(res.available)} ${entry.p.unit ?? "Pcs"} of ${entry.p.name} in stock`);
+        return; // stay on the quantity box — nothing applied
+      case "remove":
+        setQty(editing.id, 0);
+        beepOk();
+        return focusScan();
+      case "unchanged":
+        setEditing({ id: editing.id, field: "disc" });
+        return;
+      case "set":
+        setQty(editing.id, res.qty);
+        setQtyDraft(String(res.qty));
+        setEditing({ id: editing.id, field: "disc" });
+        return;
+    }
   }
 
-  /** Apply the typed discount (blank = 0) and hand focus back to the scan box. */
+  /**
+   * Apply the typed discount (blank = none) and hand focus back to the scan box.
+   * A discount larger than the line is refused and reported rather than silently
+   * reduced to the line total, which is what clampDisc() used to do with no
+   * message at all.
+   */
   function commitDisc() {
     if (!editing) return;
-    const raw = discDraft.trim();
-    const n = raw === "" ? 0 : Number(raw);
-    if (!Number.isFinite(n) || n < 0) { beepError(); return; }
-    if (n === 0) clearLineDiscount(editing.id);
-    else setLineDiscount(editing.id, n);
+    const entry = cart.get(editing.id);
+    if (!entry) return focusScan();
+
+    const res = resolveDiscountEdit(discDraft, entry.p.price * entry.qty);
+    switch (res.kind) {
+      case "invalid":
+        beepError();
+        flash(false, "Enter a discount of 0 or more");
+        return; // stay on the discount box
+      case "exceedsLine":
+        beepError();
+        flash(false, `Discount cannot exceed ${formatPKR(res.max)} on this line`);
+        return; // stay on the discount box — nothing applied
+      case "clear":
+        clearLineDiscount(editing.id);
+        break;
+      case "set":
+        setLineDiscount(editing.id, res.discount);
+        break;
+    }
     beepOk();
     focusScan();
   }
@@ -441,9 +504,21 @@ export function PosClient({
   // fired when the typed text matched exactly ONE product, which is why
   // "type a name + Enter" so often did nothing.
   function addResolved(p: PosProduct, qty = 1, note?: string): boolean {
-    if (p.available <= 0) {
+    const available = availableOf(p);
+    if (available <= 0) {
       beepError();
       flash(false, `${p.name} is out of stock`);
+      return false;
+    }
+    // The line's RESULTING quantity has to fit the stock, not just this one
+    // increment: scanning the same item ten times with three on hand used to
+    // put ten on the bill, because the only gate was "available > 0". A line
+    // that would go past stock is refused here for the same reason F8 refuses
+    // it — an invalid quantity must never reach the bill.
+    const resulting = (cart.get(p.variant_id)?.qty ?? 0) + qty;
+    if (qty > 0 && resulting > available) {
+      beepError();
+      flash(false, `Only ${formatQty(available)} ${p.unit ?? "Pcs"} of ${p.name} in stock`);
       return false;
     }
     add(p, qty);
@@ -909,6 +984,20 @@ export function PosClient({
         if (!cart.size) { beepError(); flash(false, "Cart is empty — nothing to charge"); return; }
         openPayment();
         return;
+      case "cancelBillDiscount":
+        setDiscount("");
+        focusScan();
+        flash(false, "Bill discount removed");
+        return;
+      case "billDiscount":
+        if (anyModal) return;
+        if (!cart.size) { beepError(); flash(false, "Cart is empty — nothing to discount"); return; }
+        // Leave any cart-line editor first, so two editors never compete for
+        // the keyboard, then hand focus to the bill-discount box itself.
+        setEditing(null);
+        setBillDiscountFocus((n) => n + 1);
+        flash(true, "Bill discount — type an amount, Enter to apply");
+        return;
       case "print":
         // F9 is state-aware. An uncharged cart with items means "charge this as
         // cash and print it"; anything else means "print / reprint what's
@@ -943,7 +1032,8 @@ export function PosClient({
       case "incQty": {
         if (anyModal) return;
         const p = filtered[highlight];
-        if (p && p.available > 0) add(p, 1);
+        // Through addResolved() so "+" obeys the same stock gate as a scan.
+        if (p) addResolved(p);
         return;
       }
       case "decQty": {
@@ -970,8 +1060,10 @@ export function PosClient({
   shortcutRef.current = (e: KeyboardEvent) => {
     const t = e.target as HTMLElement | null;
     const inCartEdit = !!t && typeof t.closest === "function" && !!t.closest("[data-cart-edit]");
+    const inBillDiscount = !!t && t.dataset?.billDiscount === "1";
     const action = resolveShortcut(e, {
       inCartEdit,
+      inBillDiscount,
       inField: !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable),
       searchEmpty: q === "",
       anyModal: paymentOpen || returnsOpen || cameraOpen || !!receiptData,
@@ -982,7 +1074,7 @@ export function PosClient({
       // what it was understood to mean. See the POS shortcut notes.
       console.info("[pos-keys]", {
         key: e.key, code: e.code, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey,
-        repeat: e.repeat, target: t?.tagName, inCartEdit, action: action ?? "(ignored)",
+        repeat: e.repeat, target: t?.tagName, inCartEdit, inBillDiscount, action: action ?? "(ignored)",
       });
     }
 
@@ -1173,6 +1265,7 @@ export function PosClient({
           processing={processing} onCharge={openPayment} onHold={holdSale}
           editing={editing} qtyDraft={qtyDraft} setQtyDraft={setQtyDraft} discDraft={discDraft} setDiscDraft={setDiscDraft}
           beginEdit={beginEdit} commitQty={commitQty} commitDisc={commitDisc} cancelEdit={focusScan} activeLine={activeLine}
+          billDiscountFocus={billDiscountFocus}
         />
       </div>
 
@@ -1201,7 +1294,8 @@ export function PosClient({
               setQty={setQty} remove={(id) => setQty(id, 0)} setLineDiscount={setLineDiscount} clearLineDiscount={clearLineDiscount}
               processing={processing} onCharge={openPayment} onHold={holdSale}
               editing={editing} qtyDraft={qtyDraft} setQtyDraft={setQtyDraft} discDraft={discDraft} setDiscDraft={setDiscDraft}
-              beginEdit={beginEdit} commitQty={commitQty} commitDisc={commitDisc} cancelEdit={focusScan} activeLine={activeLine} embedded
+              beginEdit={beginEdit} commitQty={commitQty} commitDisc={commitDisc} cancelEdit={focusScan} activeLine={activeLine}
+          billDiscountFocus={billDiscountFocus} embedded
             />
           </div>
         </div>
@@ -1309,6 +1403,7 @@ function CartPanel({
   customers, customerId, customerName, setCustomer, onCreateCustomer,
   setQty, remove, setLineDiscount, clearLineDiscount, processing, onCharge, onHold, embedded,
   editing, qtyDraft, setQtyDraft, discDraft, setDiscDraft, beginEdit, commitQty, commitDisc, cancelEdit, activeLine,
+  billDiscountFocus,
 }: {
   lines: CartEntry[];
   subtotal: number; discount: string; setDiscount: (v: string) => void; total: number;
@@ -1326,12 +1421,26 @@ function CartPanel({
   qtyDraft: string; setQtyDraft: (v: string) => void;
   discDraft: string; setDiscDraft: (v: string) => void;
   beginEdit: (id?: string) => void; commitQty: () => void; commitDisc: () => void; cancelEdit: () => void;
+  /** Bumped to ask the VISIBLE copy of this panel to focus its discount box. */
+  billDiscountFocus: number;
   activeLine: string | null;
 }) {
   // Only the ONE line in edit mode renders these inputs, so a single pair of
   // refs can never target the wrong line however many lines are in the cart.
   const qtyRef = useRef<HTMLInputElement>(null);
   const discRef = useRef<HTMLInputElement>(null);
+  const billRef = useRef<HTMLInputElement>(null);
+
+  // The bill-discount shortcut. Only the copy of this panel that is actually
+  // on screen responds (the other is display:none, so offsetParent is null) —
+  // the same guard the qty/discount editor uses below.
+  useEffect(() => {
+    if (!billDiscountFocus) return;
+    const el = billRef.current;
+    if (!el || el.offsetParent === null) return;
+    el.focus();
+    el.select();
+  }, [billDiscountFocus]);
   const editKey = editing ? `${editing.id}:${editing.field}` : "";
   useEffect(() => {
     if (!editing) return;
@@ -1475,7 +1584,23 @@ function CartPanel({
 
         <div className="flex items-center justify-between gap-3 text-sm">
           <span className="text-text-secondary">Bill discount</span>
-          <Input type="number" value={discount} onChange={(e) => setDiscount(e.target.value)} placeholder="0" className="h-8 w-28 text-right" />
+          <Input
+            ref={billRef}
+            type="number"
+            value={discount}
+            onChange={(e) => setDiscount(e.target.value)}
+            data-bill-discount="1"
+            onKeyDown={(e) => {
+              // Enter/Tab hands the till back to scanning; the amount is already
+              // applied on change. Escape is NOT handled here — the shortcut
+              // listener sees it first in the capture phase, and resolves it to
+              // "cancelBillDiscount" via the inBillDiscount context flag.
+              if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); cancelEdit(); }
+            }}
+            placeholder="0"
+            className="h-8 w-28 text-right"
+            title="Discount the whole bill (F7)"
+          />
         </div>
         {tax > 0 && (
           <div className="flex items-center justify-between text-sm">
