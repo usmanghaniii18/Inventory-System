@@ -221,6 +221,21 @@ export function lookupBarcodeLoose(code: string): CatalogItem | null {
   return null;
 }
 
+/**
+ * Is this string EXACTLY a barcode in the catalogue?
+ *
+ * Exact equality against the scan index — no prefix, substring, zero-padding
+ * or fuzzy fallback of any kind. The wedge detector uses it to decide whether
+ * a burst too short to judge on timing alone is a real scan, so anything
+ * looser here would hand that decision back to guesswork.
+ *
+ * Ambiguous codes are already absent from the index (build() drops any code
+ * claimed by two variants), so a duplicate can never answer true.
+ */
+export function isKnownBarcode(code: string): boolean {
+  return !!snapshot && !!code && snapshot.byBarcode.has(code);
+}
+
 export function lookupByVariant(variantId: string): CatalogItem | null {
   return snapshot?.byVariant.get(variantId) ?? null;
 }

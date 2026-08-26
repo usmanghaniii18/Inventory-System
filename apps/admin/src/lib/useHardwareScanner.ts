@@ -43,7 +43,19 @@ const SLOW_DIGIT_GAP_MS = 140;
 const SLOW_DIGIT_MIN_LENGTH = 8;
 const NEW_SEQUENCE_GAP_MS = 250; // a longer pause starts a brand-new sequence
 const FLUSH_IDLE_MS = 140; // flush a buffered burst this long after the last key
-const MIN_SCAN_LENGTH = 6; // real barcodes are >=8 digits; 6 keeps fast-typed numbers safe
+// Length below which a burst needs corroboration before it counts as a scan.
+// The original comment here read "real barcodes are >=8 digits" — true of
+// manufacturer EANs, and false of this shop: an audit of the live catalogue
+// found 794 of 2335 barcodes (34%), covering 758 active sellable variants,
+// shorter than this. They are hand-entered shelf codes like "3DX", "09F",
+// "411". The printed labels are perfectly good Code-128; it was this threshold
+// alone that made them unscannable.
+const MIN_SCAN_LENGTH = 6;
+// A shorter burst is accepted ONLY when it is, exactly, a barcode the
+// catalogue already knows (see SHORT-BURST RULE on looksLikeScan). One
+// character is never enough: a single keystroke carries no timing evidence at
+// all — avgGap() is 0 for it, which would read as infinitely fast.
+const SHORT_SCAN_MIN_LENGTH = 2;
 // Duplicate suppression, measured as the QUIET GAP between the end of one burst
 // and the start of the next — not flush-to-flush as before. That old measure
 // scaled with the length of the code, so for a 13-digit barcode a 300ms window
@@ -92,6 +104,16 @@ export interface ScanDetectorHost {
   focus(): FocusKind;
   /** Remove characters that leaked into the focused field before we were sure. */
   stripLeaked(leaked: string): void;
+  /**
+   * Is this string EXACTLY a barcode in the catalogue? Exact equality only —
+   * never a prefix, substring or fuzzy match. It is what lets a burst too
+   * short to judge on timing alone be accepted, so the discipline has to be
+   * the same one the resolve path uses: match exactly or do not match.
+   *
+   * Omitted (or false) simply means short bursts are never accepted, which is
+   * the behaviour that existed before.
+   */
+  isKnownCode?(code: string): boolean;
   onScan(code: string): void;
   /**
    * A burst that carried machine-speed keystrokes but could NOT be read as a
@@ -143,11 +165,42 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
 
   // Mean gap between keys; 0 for a single char (treated as fast).
   const avgGap = () => (buffer.length > 1 ? (lastTs - firstTs) / (buffer.length - 1) : 0);
-  const looksLikeScan = () => {
-    if (buffer.length < MIN_SCAN_LENGTH) return false;
+  /**
+   * Is the buffered burst a scan?
+   *
+   * `terminated` is true only on an explicit Enter/Tab from the scanner, and
+   * false on the idle-flush timer.
+   *
+   * SHORT-BURST RULE
+   * ----------------
+   * A burst under MIN_SCAN_LENGTH carries too little timing evidence to judge
+   * on speed alone, so it must clear three independent bars at once:
+   *
+   *   1. it ENDED IN A TERMINATOR. Wedge scanners send Enter; the idle-flush
+   *      path is excluded outright, because a cashier typing "3DXY" pauses
+   *      after "3DX" often enough that flushing on silence would bill an item
+   *      mid-word.
+   *   2. it arrived at MACHINE SPEED, the same mean-gap bar as any other scan.
+   *   3. it is EXACTLY a barcode the catalogue knows — not a prefix, not a
+   *      substring, not a fuzzy match. This is the same exact-match discipline
+   *      the resolve path uses, and for the same reason: guessing is what put
+   *      the wrong product on a bill.
+   *
+   * Three-of-three keeps ordinary fast typing safe. A term that does clear all
+   * three IS a barcode, and typing a barcode into the scan box and pressing
+   * Enter already added that product anyway — so the outcome is unchanged, the
+   * cashier just does not have to reach for Enter.
+   */
+  const looksLikeScan = (terminated: boolean) => {
     const mean = avgGap();
-    if (mean <= AVG_GAP_MS) return true;
-    return buffer.length >= SLOW_DIGIT_MIN_LENGTH && mean <= SLOW_DIGIT_GAP_MS && /^\d+$/.test(buffer);
+    if (buffer.length >= MIN_SCAN_LENGTH) {
+      if (mean <= AVG_GAP_MS) return true;
+      return buffer.length >= SLOW_DIGIT_MIN_LENGTH && mean <= SLOW_DIGIT_GAP_MS && /^\d+$/.test(buffer);
+    }
+    if (!terminated) return false;
+    if (buffer.length < SHORT_SCAN_MIN_LENGTH) return false;
+    if (mean > AVG_GAP_MS) return false;
+    return host.isKnownCode?.(normalizeScan(buffer)) === true;
   };
 
   /**
@@ -204,7 +257,8 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
     if (timer !== null) host.clearTimer(timer);
     timer = host.setTimer(() => {
       timer = null;
-      if (looksLikeScan()) flush();
+      // Idle flush: no terminator arrived, so a short burst can never qualify.
+      if (looksLikeScan(false)) flush();
       else abandon();
     }, FLUSH_IDLE_MS);
   };
@@ -218,12 +272,12 @@ export function createScanDetector(host: ScanDetectorHost): ScanDetector {
 
     // Terminators — a wedge scanner usually ends the burst with Enter (or Tab).
     if (e.key === "Enter" || e.key === "Tab") {
-      if (looksLikeScan()) {
+      if (looksLikeScan(true)) {
         e.preventDefault();
         e.stopPropagation();
         flush();
       } else {
-        if (debug() && buffer.length >= MIN_SCAN_LENGTH) {
+        if (debug() && buffer.length >= SHORT_SCAN_MIN_LENGTH) {
           console.info("[scan] ignored (looks like typing)", { buffer, len: buffer.length, avgGapMs: Math.round(avgGap()) });
         }
         // A half-read scan must not fall through to the field's Enter handler
@@ -303,13 +357,20 @@ function stripLeakedFromDom(leaked: string) {
 
 export function useHardwareScanner(
   onScan: (code: string) => void,
-  opts: { enabled?: boolean; onPartial?: (fragment: string) => void } = {},
+  opts: {
+    enabled?: boolean;
+    onPartial?: (fragment: string) => void;
+    /** Exact-equality catalogue membership test — see ScanDetectorHost. */
+    isKnownCode?: (code: string) => boolean;
+  } = {},
 ) {
   const { enabled = true } = opts;
   const onScanRef = useRef(onScan);
   onScanRef.current = onScan;
   const onPartialRef = useRef(opts.onPartial);
   onPartialRef.current = opts.onPartial;
+  const isKnownCodeRef = useRef(opts.isKnownCode);
+  isKnownCodeRef.current = opts.isKnownCode;
 
   useEffect(() => {
     if (!enabled) return;
@@ -324,6 +385,7 @@ export function useHardwareScanner(
       stripLeaked: stripLeakedFromDom,
       onScan: (code) => onScanRef.current(code),
       onPartial: (fragment) => onPartialRef.current?.(fragment),
+      isKnownCode: (code) => isKnownCodeRef.current?.(code) === true,
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
     });

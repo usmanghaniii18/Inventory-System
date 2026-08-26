@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { ScanLine } from "lucide-react";
 import { useHardwareScanner } from "@/lib/useHardwareScanner";
 import { parseScan } from "@/lib/barcode";
-import { ensureCatalog, lookupBarcodeLoose, type CatalogItem } from "@/lib/catalog-cache";
+import { ensureCatalog, lookupBarcodeLoose, isKnownBarcode, type CatalogItem } from "@/lib/catalog-cache";
 import { beepOk, beepError } from "@/lib/sound";
 import { ScanActionSheet } from "./ScanActionSheet";
 import { CameraScanner } from "./CameraScannerLazy";
@@ -79,7 +79,12 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     setUnknown(fragment ? `${fragment}…` : "(unreadable scan)");
   }, []);
 
-  useHardwareScanner(onScan, { onPartial });
+  // isKnownCode lets the detector accept a burst shorter than a normal barcode
+  // when it is EXACTLY a code the catalogue holds — the shop's hand-entered
+  // shelf codes ("3DX", "09F") are 2-5 characters and were unscannable without
+  // it. One global catalogue snapshot backs every screen, so this is wired once
+  // here rather than per screen.
+  useHardwareScanner(onScan, { onPartial, isKnownCode: isKnownBarcode });
 
   const register = useCallback((h: Handler | null) => { handlerRef.current = h; }, []);
   const registerPartial = useCallback((h: PartialHandler | null) => { partialRef.current = h; }, []);

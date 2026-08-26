@@ -5,7 +5,12 @@ import pg from "pg";
 import dotenv from "dotenv";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: join(__dirname, "..", ".env.local") });
+// Env lives with the app it belongs to (apps/admin/.env.local) since the
+// monorepo split; the repo-root path is kept as a fallback for older checkouts.
+// Both are covered by .gitignore's `.env*.local` rule — never commit either.
+for (const p of [join(__dirname, "..", "apps", "admin", ".env.local"), join(__dirname, "..", ".env.local")]) {
+  dotenv.config({ path: p });
+}
 
 const REF = process.env.SUPABASE_PROJECT_REF;
 const PASSWORD = process.env.SUPABASE_DB_PASSWORD;

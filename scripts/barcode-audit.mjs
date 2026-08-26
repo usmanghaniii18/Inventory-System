@@ -10,9 +10,15 @@
 //      keeps the code.
 //   2. variants with NO barcode — items that cannot be scanned at the till.
 //   3. variants with more than one PRIMARY barcode — ambiguous "the barcode".
-//   4. malformed / suspicious codes — whitespace or control characters inside
-//      the stored value (a scanner CR/LF that got saved), non-EAN check digits
-//      on 13-digit codes, and codes too short to be scannable.
+//   4. CORRUPT codes — whitespace or control characters inside the stored
+//      value (a scanner CR/LF that got saved) and 13-digit codes whose EAN-13
+//      check digit does not compute. These are real data faults.
+//   5. SHORT codes — valid, correctly stored, but under the length the
+//      wedge detector needs corroboration for. Reported SEPARATELY from
+//      corruption: an earlier version lumped the two together and announced
+//      "796 records need manual correction" when 794 of them were perfectly
+//      good hand-entered shelf codes and only 2 were actually damaged. Short
+//      codes are a scanner matter, not a data-cleanup one — do not reprint them.
 //   5. internal-sequence health — how close the generator is to exhausting the
 //      5-digit weight-template field.
 //
@@ -68,18 +74,37 @@ const Q = {
   seq: `select last_value, is_called from internal_barcode_seq`,
 };
 
-function classify(code) {
+/**
+ * Length at which the wedge detector accepts a burst on timing alone. Below it
+ * a scan is accepted only when it EXACTLY matches a catalogue barcode - see
+ * MIN_SCAN_LENGTH / SHORT_SCAN_MIN_LENGTH in apps/admin/src/lib/
+ * useHardwareScanner.ts. A short code is a note here, not a defect.
+ */
+const SCANNER_MIN_LENGTH = 6;
+const SHORT_SCAN_MIN_LENGTH = 2;
+
+/** Genuine data faults: the stored value itself is damaged. */
+function corruption(code) {
   const bad = [];
   if (code !== code.trim()) bad.push("leading/trailing whitespace");
   if (/[\r\n\t]/.test(code)) bad.push("embedded CR/LF/Tab");
-  // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f]/.test(code)) bad.push("control character");
-  if (code.trim().length < 6) bad.push("too short to scan reliably");
+  if (/\s/.test(code.trim())) bad.push("whitespace inside the code");
   const t = code.trim();
+  if (!t.length) bad.push("empty");
   if (/^\d{13}$/.test(t) && EAN_CHECK(t.slice(0, 12)) !== Number(t[12])) {
     bad.push("13 digits but INVALID EAN-13 check digit");
   }
   return bad;
+}
+
+/** Valid but short: a scanner-behaviour note, never a data fault. */
+function shortness(code) {
+  const n = code.trim().length;
+  if (n >= SCANNER_MIN_LENGTH) return null;
+  return n < SHORT_SCAN_MIN_LENGTH
+    ? `${n} char — CANNOT SCAN (needs >= ${SHORT_SCAN_MIN_LENGTH})`
+    : `${n} char — scans via exact catalogue match`;
 }
 
 function table(rows, cols) {
@@ -98,17 +123,23 @@ async function main() {
       [Q.duplicates, Q.missing, Q.multiPrimary, Q.all, Q.seq].map((q) => db.query(q).then((r) => r.rows)),
     );
 
-    const malformed = all
-      .map((r) => ({ ...r, issues: classify(r.barcode ?? "") }))
+    const corrupt = all
+      .map((r) => ({ ...r, issues: corruption(r.barcode ?? "") }))
       .filter((r) => r.issues.length)
       .map((r) => ({ ...r, issues: r.issues.join("; ") }));
+
+    const short = all
+      .map((r) => ({ ...r, note: shortness(r.barcode ?? "") }))
+      .filter((r) => r.note);
+    const unscannable = short.filter((r) => (r.barcode ?? "").trim().length < SHORT_SCAN_MIN_LENGTH);
 
     if (CSV) {
       const out = [["section", "barcode", "product", "sku", "detail"].map(csvCell).join(",")];
       for (const r of dup) out.push(["DUPLICATE", r.barcode, r.products, "", `${r.rows} rows / ${r.variants} variants`].map(csvCell).join(","));
       for (const r of missing) out.push(["NO_BARCODE", "", r.name, r.sku, `variant ${r.variant_id}`].map(csvCell).join(","));
       for (const r of multi) out.push(["MULTI_PRIMARY", r.codes, r.name, r.sku, `${r.primaries} primary rows`].map(csvCell).join(","));
-      for (const r of malformed) out.push(["MALFORMED", r.barcode, r.name, r.sku, r.issues].map(csvCell).join(","));
+      for (const r of corrupt) out.push(["CORRUPT", r.barcode, r.name, r.sku, r.issues].map(csvCell).join(","));
+      for (const r of short) out.push(["SHORT", r.barcode, r.name, r.sku, r.note].map(csvCell).join(","));
       console.log(out.join("\n"));
       return;
     }
@@ -128,19 +159,35 @@ async function main() {
     console.log(`\n3. VARIANTS WITH >1 PRIMARY BARCODE (ambiguous) — ${multi.length}`);
     console.log(table(multi, ["name", "sku", "primaries", "codes"]));
 
-    console.log(`\n4. MALFORMED / SUSPICIOUS CODES — ${malformed.length}`);
-    console.log(table(malformed.slice(0, 50), ["barcode", "name", "sku", "issues"]));
-    if (malformed.length > 50) console.log(`  … and ${malformed.length - 50} more (use --csv for the full list)`);
+    console.log(`\n4. CORRUPT CODES (real data faults) — ${corrupt.length}`);
+    console.log("   Damaged stored values: stray whitespace, a scanner CR/LF that got");
+    console.log("   saved, or a 13-digit code whose check digit does not compute.");
+    console.log(table(corrupt.slice(0, 50), ["barcode", "name", "sku", "issues"]));
+    if (corrupt.length > 50) console.log(`  ... and ${corrupt.length - 50} more (use --csv for the full list)`);
 
-    console.log(`\n5. INTERNAL SEQUENCE — at ${seqNow}`);
+    console.log(`\n5. SHORT CODES (valid data, scanner note) — ${short.length}`);
+    console.log(`   Under ${SCANNER_MIN_LENGTH} characters, so the wedge detector will not accept them`);
+    console.log("   on timing alone. They DO scan, via exact catalogue match. Nothing to");
+    console.log("   fix in the data — do NOT reprint these labels.");
+    if (unscannable.length) {
+      console.log(`   ${unscannable.length} are under ${SHORT_SCAN_MIN_LENGTH} characters and cannot scan at all:`);
+      console.log(table(unscannable, ["barcode", "name", "sku", "note"]));
+    }
+
+    console.log(`\n6. INTERNAL SEQUENCE — at ${seqNow}`);
     console.log(`   Weight templates use a 5-digit field (max 99999): ${
       seqNow > 99_999 ? "EXHAUSTED — variable-weight codes will be refused" : `${99_999 - seqNow} left`}`);
 
-    const bad = dup.length + multi.length + malformed.length;
+    // The headline counts DATA problems only. Short-but-valid codes are
+    // excluded on purpose: they are handled in software, and reprinting a
+    // third of the shop's labels to satisfy a threshold would be waste.
+    const bad = dup.length + multi.length + corrupt.length + unscannable.length;
     console.log(`\n${"=".repeat(60)}`);
+    console.log(`  duplicates ${dup.length} | multi-primary ${multi.length} | corrupt ${corrupt.length} | unscannable ${unscannable.length}`);
+    console.log(`  (short-but-valid ${short.length - unscannable.length}: no action | missing barcode ${missing.length})`);
     console.log(bad === 0
-      ? "No integrity problems found. Unscannable items above are the only action."
-      : `${bad} record(s) need MANUAL correction. Nothing was changed by this script.`);
+      ? "\nNo data problems found. Nothing was changed by this script."
+      : `\n${bad} record(s) need MANUAL correction. Nothing was changed by this script.`);
     console.log("");
     process.exitCode = bad === 0 ? 0 : 1;
   } finally {

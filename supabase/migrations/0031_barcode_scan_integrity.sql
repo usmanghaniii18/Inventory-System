@@ -29,17 +29,23 @@
 -- environment that predates it (or had it dropped by hand) is repaired.
 do $$
 begin
+  -- Look for a unique index over exactly the `barcode` column. Reading
+  -- pg_index directly covers both a UNIQUE CONSTRAINT (which is backed by one)
+  -- and a bare unique index, and avoids comparing an aggregate of pg_attribute
+  -- .attname (type `name`) against a text[] literal — Postgres has no
+  -- `name[] = text[]` operator, which is what made the first run of this
+  -- migration fail. A PARTIAL unique index is deliberately not accepted: it
+  -- proves nothing about the table as a whole.
   if not exists (
-    select 1 from pg_constraint c
-     where c.conrelid = 'product_barcodes'::regclass
-       and c.contype  = 'u'
-       and (select array_agg(a.attname order by a.attname)
-              from unnest(c.conkey) k
-              join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k)
-           = array['barcode']
-  ) and not exists (
-    select 1 from pg_indexes
-     where tablename = 'product_barcodes' and indexname = 'uq_product_barcodes_barcode'
+    select 1
+      from pg_index i
+     where i.indrelid    = 'product_barcodes'::regclass
+       and i.indisunique
+       and i.indpred is null
+       and i.indnkeyatts = 1
+       and (select a.attname
+              from pg_attribute a
+             where a.attrelid = i.indrelid and a.attnum = i.indkey[0]) = 'barcode'
   ) then
     -- Fails loudly if live data already violates it; barcode-audit.mjs lists
     -- the offenders so they can be corrected by hand first. Never auto-edited.
@@ -78,14 +84,6 @@ create or replace view catalog_index as
       where b.variant_id = pv.id
       order by b.is_primary desc nulls last, b.id
       limit 1)                                      as barcode,
-    -- Every barcode on the variant, primary first — the scan index is built
-    -- from this, so an alternate code resolves exactly like the primary one.
-    coalesce(
-      (select array_agg(b.barcode order by b.is_primary desc nulls last, b.id)
-         from product_barcodes b
-        where b.variant_id = pv.id),
-      '{}'::text[]
-    )                                               as barcodes,
     pv.sale_price::numeric(14,2)                    as price,
     pv.cost::numeric(14,4)                          as cost,
     p.category_id,
@@ -97,7 +95,21 @@ create or replace view catalog_index as
     pv.default_discount_type                        as disc_type,
     pv.default_discount_value::numeric(14,2)        as disc_value,
     pv.reorder_point::numeric(14,3)                 as reorder_point,
-    coalesce(nullif(p.base_unit, ''), 'Pcs')        as unit
+    coalesce(nullif(p.base_unit, ''), 'Pcs')        as unit,
+    -- APPENDED LAST, deliberately. `create or replace view` may only ADD
+    -- columns at the END of the select list: inserting `barcodes` next to
+    -- `barcode`, where it reads better, renames every column after it and the
+    -- replace is rejected. Column ORDER here is a compatibility contract, not
+    -- a style choice.
+    --
+    -- Every barcode on the variant, primary first — the scan index is built
+    -- from this, so an alternate code resolves exactly like the primary one.
+    coalesce(
+      (select array_agg(b.barcode order by b.is_primary desc nulls last, b.id)
+         from product_barcodes b
+        where b.variant_id = pv.id),
+      '{}'::text[]
+    )                                               as barcodes
   from product_variants pv
   join products p on p.id = pv.product_id
   left join variant_availability va on va.variant_id = pv.id;
