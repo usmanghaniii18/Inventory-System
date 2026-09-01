@@ -2,7 +2,15 @@
 // Supabase connection pooler (IPv4). Auto-detects the project's region.
 // Idempotent: tracks applied files in _schema_migrations.
 //
-//   node scripts/migrate.mjs
+//   node scripts/migrate.mjs            -> SUPABASE_PROJECT_REF     (primary)
+//   node scripts/migrate.mjs --new      -> NEW_SUPABASE_PROJECT_REF (migration target)
+//
+// The --new switch exists because a migration between projects is the one time
+// two live databases sit side by side in the same .env.local, and "which
+// database am I actually pointed at" stops being obvious. Rather than relying
+// on shell env precedence — invisible in scrollback, and silently wrong if
+// dotenv ever starts overriding — the target is named on the command line and
+// echoed back before a single statement runs.
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,12 +25,17 @@ for (const p of [join(__dirname, "..", "apps", "admin", ".env.local"), join(__di
   dotenv.config({ path: p });
 }
 
-const REF = process.env.SUPABASE_PROJECT_REF;
-const PASSWORD = process.env.SUPABASE_DB_PASSWORD;
+const USE_NEW = process.argv.includes("--new");
+const REF_VAR = USE_NEW ? "NEW_SUPABASE_PROJECT_REF" : "SUPABASE_PROJECT_REF";
+const PW_VAR = USE_NEW ? "NEW_SUPABASE_DB_PASSWORD" : "SUPABASE_DB_PASSWORD";
+const REF = process.env[REF_VAR];
+const PASSWORD = process.env[PW_VAR];
 if (!REF || !PASSWORD) {
-  console.error("Missing SUPABASE_PROJECT_REF or SUPABASE_DB_PASSWORD in .env.local");
+  console.error(`Missing ${REF_VAR} or ${PW_VAR} in apps/admin/.env.local`);
   process.exit(1);
 }
+console.log(`Target: ${REF}   (${REF_VAR})
+`);
 
 const REGIONS = [
   "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",

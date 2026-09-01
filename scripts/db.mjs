@@ -12,8 +12,13 @@ for (const p of [join(__dirname, "..", "apps", "admin", ".env.local"), join(__di
   dotenv.config({ path: p });
 }
 
-const REF = process.env.SUPABASE_PROJECT_REF;
-const PASSWORD = process.env.SUPABASE_DB_PASSWORD;
+// `--new` points a one-off script at NEW_SUPABASE_PROJECT_REF instead of the
+// primary one. Added for the project-to-project migration, where two live
+// databases sit in the same .env.local and every audit needs running against
+// both to be worth anything.
+const USE_NEW = process.argv.includes("--new");
+const REF = USE_NEW ? process.env.NEW_SUPABASE_PROJECT_REF : process.env.SUPABASE_PROJECT_REF;
+const PASSWORD = USE_NEW ? process.env.NEW_SUPABASE_DB_PASSWORD : process.env.SUPABASE_DB_PASSWORD;
 
 const REGIONS = [
   "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
@@ -32,7 +37,7 @@ export async function connect() {
         host, port: 5432, user: `postgres.${REF}`, password: PASSWORD,
         database: "postgres", ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 8000,
       });
-      try { await client.connect(); return client; }
+      try { await client.connect(); if (process.env.DB_VERBOSE) console.log(`  (${REF} via ${host})`); return client; }
       catch { await client.end().catch(() => {}); }
     }
   }
