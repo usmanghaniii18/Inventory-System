@@ -3,6 +3,7 @@ import { createClient } from "@hamza/shared/supabase/server";
 import { fetchAll } from "@/lib/fetch-all";
 import { packRow, type DbRow } from "@/lib/catalog-payload";
 import { load as loadCatalog } from "@/lib/catalog-server-cache";
+import { noteServed } from "@/lib/catalog-egress-guard";
 
 // The lightweight catalogue index: one row per sellable variant with name,
 // option label, EVERY barcode on the variant, price, cost and live stock. The
@@ -89,9 +90,13 @@ export async function GET(req: Request) {
   // the branch that carries the overwhelming majority of requests, because the
   // shop is not editing products most of the minutes of the day.
   if (req.headers.get("if-none-match") === etag) {
+    noteServed("304");
     return new NextResponse(null, { status: 304, headers: { ...CACHE_HEADERS, ETag: etag } });
   }
 
+  // Counted so a silently broken validator shows up in the Railway logs on the
+  // first day rather than as an outage on the nineteenth. See catalog-egress-guard.
+  noteServed("full");
   return NextResponse.json(
     { items: cached.rows, fetchedAt: new Date().toISOString() },
     { headers: { ...CACHE_HEADERS, ETag: etag } },
