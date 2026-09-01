@@ -17,7 +17,19 @@ import { ensureCatalog, getSnapshot, subscribe, type CatalogSnapshot } from "@/l
  * That is why barcodes generated for the eighteen items with none still scanned
  * as "unknown" at a till whose tab predated them, on completely correct code.
  */
-const POLL_MS = 60_000;
+/**
+ * Raised from 60s. At one minute this poll, multiplied by every open tab, is
+ * what drained the Supabase egress quota and took every login down with it —
+ * the full story is in api/catalog/route.ts.
+ *
+ * The ETag makes an unchanged poll cost a few hundred bytes rather than 1.22 MB,
+ * so the interval is no longer what protects the budget. Five minutes is the
+ * safety margin behind it: if the fingerprint path ever regresses to full
+ * responses, this caps the bleeding at a fifth of what it was. Nothing a
+ * cashier does waits on it — a sale patches the local cache immediately
+ * (applyStockDelta), and focus/visibilitychange still reconcile on the spot.
+ */
+const POLL_MS = 5 * 60_000;
 
 /**
  * Subscribe to the shared local catalogue cache. Returns the current snapshot
