@@ -15,7 +15,7 @@ import { StatusPill } from "@hamza/shared/ui/StatusPill";
 import { useToast } from "@hamza/shared/ui/Toast";
 import { cn, formatPKR } from "@hamza/shared/utils";
 import { useCatalog } from "@/lib/useCatalog";
-import { ensureCatalog, type CatalogItem } from "@/lib/catalog-cache";
+import { ensureCatalog, applyStockDelta, type CatalogItem } from "@/lib/catalog-cache";
 import { useScanHandler } from "@/components/scan/ScanProvider";
 import { parseScan, looksLikeCode } from "@/lib/barcode";
 import { resolveQtyEdit, resolveDiscountEdit, formatQty } from "@/lib/pos-line-edit";
@@ -754,7 +754,14 @@ export function PosClient({
         return false;
       }
       finishSale(makeReceipt(res.receipt_no, res.subtotal, res.discount, res.tax, res.total), autoPrint);
-      void ensureCatalog({ force: true });
+      // The sale already told us what left the shelf, so spend nothing to learn
+      // it again. `force: true` here used to bypass every cache and pull the
+      // whole ~1.2 MB catalogue back after EVERY sale — 2,023 sales in nineteen
+      // days, ~2.4 GB of egress, to apply arithmetic the till had already done.
+      // Patch locally, then let the ordinary reconcile confirm it: unforced, so
+      // it revalidates against the ETag and almost always costs a bare 304.
+      applyStockDelta(payload.lines.map((l) => ({ variant_id: l.variant_id, qty: l.qty })));
+      void ensureCatalog();
       router.refresh();
       invalidateStockViews();
       return true;
@@ -841,6 +848,17 @@ export function PosClient({
     } finally {
       flushing.current = false;
       await refreshQueue();
+      // Deliberately still forced, unlike the per-sale path above. This runs
+      // only when a till reconnects after an outage, and the local copy is then
+      // untrustworthy for reasons no local patch can repair: several queued
+      // sales, possibly other tills selling the same stock while this one was
+      // dark, possibly a queued sale the server rejected. Ask for the truth.
+      //
+      // `force` is no longer expensive anyway — it means REVALIDATE, not
+      // re-download. The request still carries If-None-Match, so an unchanged
+      // catalogue answers 304 with no body; a changed one is exactly when the
+      // full payload is worth paying for. Reconnects are rare, so this costs
+      // nothing measurable against the 60-per-hour polling it replaced.
       void ensureCatalog({ force: true });
       router.refresh();
       invalidateStockViews();
